@@ -13,6 +13,8 @@ setup(
         "click>=7.0,<8",
         "click-log>=0.3.2,<1",
         "requests>=2.21.0,<3",
+        "tqdm>=4.31.1,<5",
+        "xdgappdirs>=1.4.5,<2",
     ],
     setup_requires=["setuptools_scm"],
     use_scm_version=True,
