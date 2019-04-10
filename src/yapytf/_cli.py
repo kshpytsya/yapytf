@@ -10,6 +10,7 @@ from typing import Mapping, Optional
 import click
 import click_log
 
+from . import _generator
 from . import _hashigetter
 from . import _tfschema
 
@@ -38,12 +39,12 @@ class Model:
             logger.debug("running %s, sys.path=%s", path, sys.path)
             py = runpy.run_path(str(path))
 
-        if "gen" in sys.modules:
-            raise click.ClickException(
-                '"{}" has imported "gen" module. Please wrap the import with "if typing.TYPE_CHECKING".'.format(
-                    path
-                )
-            )
+        # if "gen" in sys.modules:
+        #     raise click.ClickException(
+        #         '"{}" has imported "gen" module. Please wrap the import with "if typing.TYPE_CHECKING".'.format(
+        #             path
+        #         )
+        #     )
 
         entry = py.get("entry")
         if not callable(entry):
@@ -182,4 +183,11 @@ def lint(ctx: click.Context, **opts):
             provider_name=provider_name,
             provider_version=provider_version,
             provider_path=co.model.providers_paths[provider_name]
+        )
+        _generator.gen_provider_py(
+            work_dir=co.work_dir,
+            terraform_version=co.model.terraform_version,
+            provider_name=provider_name,
+            provider_version=provider_version,
+            provider_schema=schema
         )
