@@ -327,6 +327,48 @@ def make_list_of_class(
     return ".".join(class_path + [list_class_name])
 
 
+def python_type_ann(tf_type) -> str:
+    if isinstance(tf_type, list):
+        if tf_type[0] in {"list", "set"} and len(tf_type) == 2:
+            return f"List[{python_type_ann(tf_type[1])}]"
+        if tf_type[0] == "map" and len(tf_type) == 2:
+            return f"Dict[str, {python_type_ann(tf_type[1])}]"
+    else:
+        if tf_type == "bool":
+            return "bool"
+        if tf_type == "string":
+            return "str"
+        if tf_type == "number":
+            return "int"
+
+    assert 0, f"Unknow Terraform type {tf_type}"
+
+
+def python_type_assert_cond(tf_type) -> str:
+    if isinstance(tf_type, list):
+        if tf_type[0] in {"list", "set"} and len(tf_type) == 2:
+            return (
+                f"isinstance(value, list) and "
+                f"all({python_type_assert_cond(tf_type[1])} for value in value)"
+            )
+        if tf_type[0] == "map" and len(tf_type) == 2:
+            return (
+                f"isinstance(value, dict) and "
+                f"all(isinstance(key, str) and {python_type_assert_cond(tf_type[1])} "
+                f"for key, value in value.items())"
+            )
+            return f"Dict[str, {python_type_ann(tf_type[1])}]"
+    else:
+        if tf_type == "bool":
+            return "isinstance(value, bool)"
+        if tf_type == "string":
+            return "isinstance(value, str)"
+        if tf_type == "number":
+            return "isinstance(value, int)"
+
+    assert 0, f"Unknow Terraform type {tf_type}"
+
+
 def gen_provider_py(
     *,
     work_dir: pathlib.Path,
@@ -340,10 +382,25 @@ def gen_provider_py(
     )
 
     def produce(dir_path: pathlib.Path) -> None:
+        dir_path1 = dir_path.joinpath(provider_name)
+        dir_path1.mkdir()
+
+        def finalize_builder(name, builder):
+            fname = f"{name}.py"
+            produced = builder.produce()
+            try:
+                ast.parse(produced, filename=fname)
+            except SyntaxError:
+                work_dir.joinpath(fname).write_text(produced)
+                raise
+
+            dir_path1.joinpath(fname).write_text(produced)
+
         provider_name_ = f"{provider_name}_"
 
         pschema = provider_schema["provider_schemas"][provider_name]
         builder = Builder()
+        imports_block = builder.block(indented=False)
 
         def make_v1():
             KIND_TO_KEY = {
@@ -361,17 +418,25 @@ def gen_provider_py(
 
                 for rname, rschema in sorted(pschema.get(f"{kind}_schemas", {}).items()):
                     if rname == provider_name:
-                        continue
+                        stripped_name = "_"
+                    else:
+                        assert rname.startswith(provider_name_)
+                        stripped_name = rname[len(provider_name_):]
 
-                    assert rname.startswith(provider_name_)
-                    stripped_name = rname[len(provider_name_):]
+                    module_name = f"v1_{kind}_{stripped_name}"
+                    imports_block.line(f"from . import {module_name}")
+                    module_builder = Builder()
+
+                    module_builder.lines([
+                        "import copy",
+                        "from typing import overload, Iterable, Optional, MutableMapping, MutableSequence, List, Dict, Any, Union"
+                    ])
+                    module_builder.blanks(1)
 
                     bag_of_prop_name = f"_prop_{stripped_name}"
                     class_slots.append(bag_of_prop_name)
-                    res_instance_class_name = f"v1_{kind}_instance_{stripped_name}"
-                    res_bag_of_class_name = f"v1_{kind}_bag_of_{stripped_name}"
                     init_block.line(
-                        f"self.{bag_of_prop_name}: \"{res_bag_of_class_name}\" = {res_bag_of_class_name}(data)"
+                        f"self.{bag_of_prop_name}: {module_name}.Bag = {module_name}.Bag(data)"
                     )
 
                     def_block(
@@ -379,15 +444,15 @@ def gen_provider_py(
                         1,
                         f"def {stripped_name}",
                         ["self"],
-                        f" -> \"{res_bag_of_class_name}\"",
+                        f" -> {module_name}.Bag",
                         decorators=["property"],
                         lines=[f"return self.{bag_of_prop_name}"]
                     )
 
                     make_bag_of_class(
-                        builder=builder,
-                        bag_class_name=res_bag_of_class_name,
-                        instance_class_name=res_instance_class_name,
+                        builder=module_builder,
+                        bag_class_name="Bag",
+                        instance_class_name="Instance",
                         class_path=[],
                         data_path=[KIND_TO_KEY[kind], rname],
                     )
@@ -439,48 +504,9 @@ def gen_provider_py(
 
                             for attr_name, attr_schema in schema.get("block", {}).get("attributes", {}).items():
                                 assert attr_name.isidentifier()
-
-                                def python_type_ann(tf_type) -> str:
-                                    if isinstance(tf_type, list):
-                                        if tf_type[0] in {"list", "set"} and len(tf_type) == 2:
-                                            return f"List[{python_type_ann(tf_type[1])}]"
-                                        if tf_type[0] == "map" and len(tf_type) == 2:
-                                            return f"Dict[str, {python_type_ann(tf_type[1])}]"
-                                    else:
-                                        if tf_type == "bool":
-                                            return "bool"
-                                        if tf_type == "string":
-                                            return "str"
-                                        if tf_type == "number":
-                                            return "int"
-
-                                    assert 0, f"Unknow Terraform type {tf_type}"
+                                attr_slug = "_" if keyword.iskeyword(attr_name) else ""
 
                                 python_type = python_type_ann(attr_schema["type"])
-
-                                def python_type_assert_cond(tf_type) -> str:
-                                    if isinstance(tf_type, list):
-                                        if tf_type[0] in {"list", "set"} and len(tf_type) == 2:
-                                            return (
-                                                f"isinstance(value, list) and "
-                                                f"all({python_type_assert_cond(tf_type[1])} for value in value)"
-                                            )
-                                        if tf_type[0] == "map" and len(tf_type) == 2:
-                                            return (
-                                                f"isinstance(value, dict) and "
-                                                f"all(isinstance(key, str) and {python_type_assert_cond(tf_type[1])} "
-                                                f"for key, value in value.items())"
-                                            )
-                                            return f"Dict[str, {python_type_ann(tf_type[1])}]"
-                                    else:
-                                        if tf_type == "bool":
-                                            return "isinstance(value, bool)"
-                                        if tf_type == "string":
-                                            return "isinstance(value, str)"
-                                        if tf_type == "number":
-                                            return "isinstance(value, int)"
-
-                                    assert 0, f"Unknow Terraform type {tf_type}"
 
                                 def_block(
                                     class_builder,
@@ -496,7 +522,7 @@ def gen_provider_py(
                                 def_block(
                                     class_builder,
                                     1,
-                                    f"def {attr_name}",
+                                    f"def {attr_name}{attr_slug}",
                                     ["self"],
                                     f" -> Optional[{python_type}]",
                                     decorators=["property"],
@@ -511,10 +537,10 @@ def gen_provider_py(
                                 def_block(
                                     class_builder,
                                     1,
-                                    f"def {attr_name}",
+                                    f"def {attr_name}{attr_slug}",
                                     ["self", f"value: {python_type}"],
                                     " -> None",
-                                    decorators=[f"{attr_name}.setter"],
+                                    decorators=[f"{attr_name}{attr_slug}.setter"],
                                     lines=[
                                         f"self._validate_{attr_name}(value)",
                                         f"self._data[\"{attr_name}\"] = value",
@@ -524,10 +550,10 @@ def gen_provider_py(
                                 def_block(
                                     class_builder,
                                     1,
-                                    f"def {attr_name}",
+                                    f"def {attr_name}{attr_slug}",
                                     ["self"],
                                     " -> None",
-                                    decorators=[f"{attr_name}.deleter"],
+                                    decorators=[f"{attr_name}{attr_slug}.deleter"],
                                     lines=[
                                         f"self._data.pop(\"{attr_name}\", None)",
                                     ]
@@ -633,28 +659,18 @@ def gen_provider_py(
 
                             return full_class_name
 
-                        make_class(builder, res_instance_class_name, rschema, [])
+                        make_class(module_builder, "Instance", rschema, [])
 
                     make_res_instance()
 
-                slots_block.line("__slots__ = ({})".format("".join(f"\"{i}\", " for i in class_slots)))
+                    finalize_builder(module_name, module_builder)
 
-        builder.lines([
-            "import copy",
-            "from typing import overload, Iterable, Optional, MutableMapping, MutableSequence, List, Dict, Any, Union"
-        ])
-        builder.blanks(1)
+                slots_block.line("__slots__ = ({})".format("".join(f"\"{i}\", " for i in class_slots)))
 
         make_v1()
 
-        fname = "{}.py".format(provider_name)
-        produced = builder.produce()
-        try:
-            ast.parse(produced, filename=fname)
-        except SyntaxError:
-            work_dir.joinpath(fname).write_text(produced)
-            raise
+        imports_block.blanks(1)
 
-        dir_path.joinpath(fname).write_text(produced)
+        finalize_builder("__init__", builder)
 
     return _pcache.get(key, produce)
