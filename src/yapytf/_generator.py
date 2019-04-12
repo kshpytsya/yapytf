@@ -1,9 +1,11 @@
 import ast
 import keyword
 import pathlib
-from typing import List, Tuple, Union
+from typing import List, Dict, Tuple, Union, Mapping, Generator, Iterable
 
 from . import _pcache
+
+DATA_TYPE_HINT = "Dict[str, Any]"
 
 
 class Builder:
@@ -136,7 +138,7 @@ def make_bag_of_class(
         class_builder,
         1,
         "def __init__",
-        ["self", "data: Dict[str, Any]"],
+        ["self", f"data: {DATA_TYPE_HINT}"],
         lines=[
             "self._data = data" + "".join(f".setdefault(\"{i}\", {{}})" for i in data_path),
         ]
@@ -310,7 +312,7 @@ def make_list_of_class(
         ["self", "idx"],
         f" -> \"{full_instance_class_name}\"",
         lines=[
-            "data: Dict[str, Any] = {}",
+            f"data: {DATA_TYPE_HINT} = {{}}",
             "self._data.insert(idx, data)",
             f"return {full_instance_class_name}(data)",
         ]
@@ -325,6 +327,87 @@ def make_list_of_class(
     )
 
     return ".".join(class_path + [list_class_name])
+
+
+def wrap_list(
+    items: Iterable[str],
+    sep: str = ",",
+    width: int = 70,
+) -> Generator[str, None, None]:
+    line: List[str] = []
+    line_len = 0
+
+    sep_len = len(sep)
+
+    for item in items:
+        item_and_sep_len = len(item) + sep_len
+        if line and line_len + item_and_sep_len >= width:
+            yield "".join(line)
+            line = []
+            line_len = 0
+
+        if line:
+            line.append(" ")
+            line_len += 1
+
+        line.extend([item, sep])
+        line_len += item_and_sep_len
+
+    if line:
+        yield "".join(line)
+
+
+def make_ns_class(
+    *,
+    builder=Builder,
+    class_name: str,
+    data_type: str,
+    props: Mapping[str, str],
+    nested: bool = False,
+) -> None:
+    class_builder = def_block(
+        builder,
+        1 if nested else 2,
+        f"class {class_name}",
+    )
+
+    slots = ["\"_data\""]
+    slots.extend(f"\"_prop_{i}\"" for i in sorted(props))
+    slots_lines = list(wrap_list(slots))
+    if len(slots_lines) > 1:
+        class_builder.line("__slots__ = (")
+        class_builder.lines([f"\t{i}" for i in slots_lines])
+        class_builder.line(")")
+    else:
+        class_builder.line(f"__slots__ = ({slots_lines[0]})")
+
+    init_block = def_block(
+        class_builder,
+        1,
+        "def __init__",
+        ["self", f"data: {data_type}"],
+        " -> None"
+    )
+    init_block.line("self._data = data")
+
+    for prop_name, prop_type in props.items():
+        assert prop_name.isidentifier()
+        prop_name_slug = "_" if keyword.iskeyword(prop_name) else ""
+        init_block.line(f"self._prop_{prop_name}: Optional[\"{prop_type}\"] = None")
+
+        def_block(
+            class_builder,
+            1,
+            f"def {prop_name}{prop_name_slug}",
+            ["self"],
+            f" -> \"{prop_type}\"",
+            decorators=["property"],
+            lines=[
+                f"if self._prop_{prop_name} is None:",
+                f"\tself._prop_{prop_name} = {prop_type}(self._data)",
+                f"return self._prop_{prop_name}"
+            ]
+        )
 
 
 def python_type_ann(tf_type) -> str:
@@ -382,9 +465,6 @@ def gen_provider_py(
     )
 
     def produce(dir_path: pathlib.Path) -> None:
-        dir_path1 = dir_path.joinpath(provider_name)
-        dir_path1.mkdir()
-
         def finalize_builder(name, builder):
             fname = f"{name}.py"
             produced = builder.produce()
@@ -394,13 +474,14 @@ def gen_provider_py(
                 work_dir.joinpath(fname).write_text(produced)
                 raise
 
-            dir_path1.joinpath(fname).write_text(produced)
+            dir_path.joinpath(fname).write_text(produced)
 
         provider_name_ = f"{provider_name}_"
 
         pschema = provider_schema["provider_schemas"][provider_name]
         builder = Builder()
         imports_block = builder.block(indented=False)
+        imports_block.line("from typing import Any, Dict, Optional")
 
         def make_v1():
             KIND_TO_KEY = {
@@ -409,14 +490,9 @@ def gen_provider_py(
             }
 
             for kind in ["data_source", "resource"]:
-                class_builder = def_block(builder, 2, f"class v1_{kind}s_{provider_name}")
-                slots_block = class_builder.block(indented=False)
-                class_slots = ["_data"]
+                ns_props: Dict[str, str] = {}
 
-                init_block = def_block(class_builder, 1, "def __init__", ["self", "data"])
-                init_block.line("self._data = data")
-
-                for rname, rschema in sorted(pschema.get(f"{kind}_schemas", {}).items()):
+                for rname, rschema in pschema.get(f"{kind}_schemas", {}).items():
                     if rname == provider_name:
                         stripped_name = "_"
                     else:
@@ -433,21 +509,7 @@ def gen_provider_py(
                     ])
                     module_builder.blanks(1)
 
-                    bag_of_prop_name = f"_prop_{stripped_name}"
-                    class_slots.append(bag_of_prop_name)
-                    init_block.line(
-                        f"self.{bag_of_prop_name}: {module_name}.Bag = {module_name}.Bag(data)"
-                    )
-
-                    def_block(
-                        class_builder,
-                        1,
-                        f"def {stripped_name}",
-                        ["self"],
-                        f" -> {module_name}.Bag",
-                        decorators=["property"],
-                        lines=[f"return self.{bag_of_prop_name}"]
-                    )
+                    ns_props[stripped_name] = f"{module_name}.Bag"
 
                     make_bag_of_class(
                         builder=module_builder,
@@ -665,7 +727,12 @@ def gen_provider_py(
 
                     finalize_builder(module_name, module_builder)
 
-                slots_block.line("__slots__ = ({})".format("".join(f"\"{i}\", " for i in class_slots)))
+                make_ns_class(
+                    builder=builder,
+                    class_name=f"v1_{kind}s",
+                    data_type=DATA_TYPE_HINT,
+                    props=ns_props,
+                )
 
         make_v1()
 
@@ -674,3 +741,66 @@ def gen_provider_py(
         finalize_builder("__init__", builder)
 
     return _pcache.get(key, produce)
+
+
+def gen_yapytfgen(
+    *,
+    dest: pathlib.Path,
+    providers_paths: Mapping[str, pathlib.Path],
+) -> None:
+    module_dir = dest.joinpath("yapytfgen")
+    module_dir.mkdir()
+
+    module_fname = module_dir.joinpath("__init__.py")
+    builder = Builder()
+
+    builder.line("from typing import Optional, Dict, Any")
+    builder.lines([
+        f"from . import {provider_name} as _{provider_name}"
+        for provider_name in providers_paths
+    ])
+    builder.blanks(1)
+
+    def ns(class_name, props):
+        make_ns_class(
+            builder=builder,
+            class_name=class_name,
+            data_type=DATA_TYPE_HINT,
+            props=props,
+        )
+
+    ns(
+        "model",
+        {"tf": "model_tf"}
+    )
+
+    ns(
+        "model_tf",
+        {"v1": "model_tf_v1"}
+    )
+
+    ns(
+        "model_tf_v1",
+        {
+            "d": "model_tf_v1_data_sources",
+            "r": "model_tf_v1_resources",
+        }
+    )
+
+    for kind in ["data_source", "resource"]:
+        ns(
+            f"model_tf_v1_{kind}s",
+            {
+                provider_name: f"_{provider_name}.v1_{kind}s"
+                for provider_name in providers_paths
+            }
+        )
+
+    produced = builder.produce()
+    module_fname.write_text(produced)
+    ast.parse(produced, filename=str(module_fname))
+
+    for provider_name, provider_path in providers_paths.items():
+        module_dir.joinpath(provider_name).symlink_to(provider_path, target_is_directory=True)
+
+    # TODO add to .gitignore. Use atomicwrite package

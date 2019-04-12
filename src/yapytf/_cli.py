@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 import pathlib
@@ -5,14 +6,15 @@ import runpy
 import shutil
 import sys
 import tempfile
-from typing import Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import click
 import click_log
+import jsonschema
+from implements import implements
 
-from . import _generator
-from . import _hashigetter
-from . import _tfschema
+from . import _generator, _hashigetter, _tfschema
+from .cfginterface import IConfiguration
 
 logger = logging.getLogger(__name__)
 click_log.basic_config(logger)
@@ -33,28 +35,60 @@ class AddPath:
             pass
 
 
+class ConfigurationBase:
+    @staticmethod
+    def schema(schema: Dict[str, Any]) -> None:
+        pass
+    pass
+
+
 class Model:
-    def __init__(self, path: pathlib.Path, model_params: dict):
+    versions: Mapping
+    _terraform_path: Optional[pathlib.Path]
+    _providers_paths: Optional[Mapping[str, pathlib.Path]]
+
+    def __init__(
+        self,
+        *,
+        path: pathlib.Path,
+        model_params: dict,
+        model_class: str,
+    ):
         with AddPath(str(path.parent)):
             logger.debug("running %s, sys.path=%s", path, sys.path)
             py = runpy.run_path(str(path))
 
-        # if "gen" in sys.modules:
-        #     raise click.ClickException(
-        #         '"{}" has imported "gen" module. Please wrap the import with "if typing.TYPE_CHECKING".'.format(
-        #             path
-        #         )
-        #     )
+        if "yapytfgen" in sys.modules:
+            raise click.ClickException(
+                f'"{path}" has imported "yapytfgen" module. Please wrap the import with "if typing.TYPE_CHECKING".'
+            )
 
-        entry = py.get("entry")
-        if not callable(entry):
-            raise click.ClickException('"entry" is not defined or is not a callable')
+        class_ = py.get(model_class)
+        if not inspect.isclass(class_):
+            raise click.ClickException(f'"{model_class}" is not defined or is not a class')
 
-        self.model_obj = entry(model_params)
-        self.versions = self.model_obj.versions()  # type: dict
+        adapted_class = implements(IConfiguration)(type(model_class, (class_, ConfigurationBase), {}))
 
-        self._terraform_path = None  # type: Optional[pathlib.Path]
-        self._providers_paths = None  # type: Optional[Mapping[str, pathlib.Path]]
+        schema: Dict[str, Any] = {
+            "$schema": "http://json-schema.org/schema#",
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False
+        }
+        adapted_class.schema(schema)
+
+        try:
+            jsonschema.validate(model_params, schema)
+        except jsonschema.exceptions.ValidationError as e:
+            raise click.ClickException(e)
+
+        self.model_obj = adapted_class(model_params)
+        self.versions = dict(providers=dict())
+        self.model_obj.versions(self.versions)
+
+        self._terraform_path = None
+        self._providers_paths = None
 
     @property
     def terraform_version(self) -> str:
@@ -110,9 +144,15 @@ class PathType(click.Path):
     show_default=True,
 )
 @click.option(
+    "--class",
+    default="Default",
+    help="Name of a model class to use.",
+    show_default=True,
+)
+@click.option(
     "--params",
     type=PathType(file_okay=True, exists=True),
-    help='json file containing model parameters passed to "entry" function in model file.',
+    help='json file containing model parameters passed to constructor of the model class.',
 )
 @click.option("--keep-work", is_flag=True, help="keep working directory")
 @click.pass_context
@@ -150,7 +190,11 @@ def main(ctx: click.Context, **opts):
     if not model_path.exists():
         raise click.FileError(str(model_path), hint="no such file")
 
-    co.model = Model(model_path, model_params=model_params)
+    co.model = Model(
+        path=model_path,
+        model_params=model_params,
+        model_class=opts["class"],
+    )
 
 
 @main.command(hidden=True)
@@ -175,6 +219,8 @@ def lint(ctx: click.Context, **opts):
     logger.debug("terraform_path: %s", co.model.terraform_path)
     logger.debug("providers_paths: %s", co.model.providers_paths)
 
+    providers_py_paths: Dict[str, pathlib.Path] = {}
+
     for provider_name, provider_version in co.model.providers_versions.items():
         schema = _tfschema.get(
             work_dir=co.work_dir,
@@ -184,10 +230,12 @@ def lint(ctx: click.Context, **opts):
             provider_version=provider_version,
             provider_path=co.model.providers_paths[provider_name]
         )
-        _generator.gen_provider_py(
+        providers_py_paths[provider_name] = _generator.gen_provider_py(
             work_dir=co.work_dir,
             terraform_version=co.model.terraform_version,
             provider_name=provider_name,
             provider_version=provider_version,
             provider_schema=schema
         )
+
+    _generator.gen_yapytfgen(dest=co.work_dir, providers_paths=providers_py_paths)
