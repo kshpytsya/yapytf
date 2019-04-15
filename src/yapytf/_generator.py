@@ -505,7 +505,8 @@ def gen_provider_py(
 
                     module_builder.lines([
                         "import copy",
-                        "from typing import overload, Iterable, Optional, MutableMapping, MutableSequence, List, Dict, Any, Union"
+                        "from typing import overload, Iterable, Optional, MutableMapping, "
+                        + "MutableSequence, List, Dict, Any, Union"
                     ])
                     module_builder.blanks(1)
 
@@ -745,12 +746,9 @@ def gen_provider_py(
 
 def gen_yapytfgen(
     *,
-    dest: pathlib.Path,
+    module_dir: pathlib.Path,
     providers_paths: Mapping[str, pathlib.Path],
 ) -> None:
-    module_dir = dest.joinpath("yapytfgen")
-    module_dir.mkdir()
-
     module_fname = module_dir.joinpath("__init__.py")
     builder = Builder()
 
@@ -802,5 +800,3 @@ def gen_yapytfgen(
 
     for provider_name, provider_path in providers_paths.items():
         module_dir.joinpath(provider_name).symlink_to(provider_path, target_is_directory=True)
-
-    # TODO add to .gitignore. Use atomicwrite package

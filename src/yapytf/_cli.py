@@ -36,10 +36,8 @@ class AddPath:
 
 
 class ConfigurationBase:
-    @staticmethod
-    def schema(schema: Dict[str, Any]) -> None:
+    def schema(self, schema: Dict[str, Any]) -> None:
         pass
-    pass
 
 
 class Model:
@@ -68,6 +66,7 @@ class Model:
             raise click.ClickException(f'"{model_class}" is not defined or is not a class')
 
         adapted_class = implements(IConfiguration)(type(model_class, (class_, ConfigurationBase), {}))
+        self.model_obj = adapted_class()
 
         schema: Dict[str, Any] = {
             "$schema": "http://json-schema.org/schema#",
@@ -76,14 +75,13 @@ class Model:
             "required": [],
             "additionalProperties": False
         }
-        adapted_class.schema(schema)
+        self.model_obj.schema(schema)
 
         try:
             jsonschema.validate(model_params, schema)
         except jsonschema.exceptions.ValidationError as e:
             raise click.ClickException(e)
 
-        self.model_obj = adapted_class(model_params)
         self.versions = dict(providers=dict())
         self.model_obj.versions(self.versions)
 
@@ -114,6 +112,36 @@ class Model:
             )
 
         return self._providers_paths
+
+    def gen_yapytfgen(
+        self,
+        *,
+        module_dir: pathlib.Path,
+        work_dir: pathlib.Path
+    ) -> None:
+        logger.debug("terraform_path: %s", self.terraform_path)
+        logger.debug("providers_paths: %s", self.providers_paths)
+
+        providers_py_paths: Dict[str, pathlib.Path] = {}
+
+        for provider_name, provider_version in self.providers_versions.items():
+            schema = _tfschema.get(
+                work_dir=work_dir,
+                terraform_path=self.terraform_path,
+                terraform_version=self.terraform_version,
+                provider_name=provider_name,
+                provider_version=provider_version,
+                provider_path=self.providers_paths[provider_name]
+            )
+            providers_py_paths[provider_name] = _generator.gen_provider_py(
+                work_dir=work_dir,
+                terraform_version=self.terraform_version,
+                provider_name=provider_name,
+                provider_version=provider_version,
+                provider_schema=schema
+            )
+
+        _generator.gen_yapytfgen(module_dir=module_dir, providers_paths=providers_py_paths)
 
 
 class Context:
@@ -211,31 +239,41 @@ def get(ctx: click.Context, **opts):
 
 @main.command()
 @click.pass_context
+@click.argument(
+    "dir",
+    type=PathType(dir_okay=True, exists=True),
+)
+def gen(ctx: click.Context, **opts):
+    """
+    (Re-)generate "yapytfgen" module in specified directory.
+    Warning, existing "yapytfgen" directory will be completely wiped out.
+    As a safeguard, a ".yapytfgen" marker file must exist in that directory.
+    """
+    co: Context = ctx.find_object(Context)
+
+    dest_dir: pathlib.Path = opts["dir"]
+    module_dir: pathlib.Path = dest_dir.joinpath("yapytfgen")
+    marker_file: pathlib.Path = module_dir.joinpath(".yapytfgen")
+    if module_dir.exists():
+        if not marker_file.exists():
+            raise click.ClickException(
+                f"Cowardly refusing to wipe existing \"{module_dir}\", "
+                + "which does not contain \".yapytfgen\" marker file"
+            )
+
+        shutil.rmtree(module_dir)
+
+    module_dir.mkdir()
+    marker_file.touch()
+    module_dir.joinpath(".gitignore").write_text("*\n")
+
+    co.model.gen_yapytfgen(module_dir=module_dir, work_dir=co.work_dir)
+
+
+@main.command()
+@click.pass_context
 def lint(ctx: click.Context, **opts):
     """
     Validate model file
     """
-    co = ctx.find_object(Context)  # type: Context
-    logger.debug("terraform_path: %s", co.model.terraform_path)
-    logger.debug("providers_paths: %s", co.model.providers_paths)
-
-    providers_py_paths: Dict[str, pathlib.Path] = {}
-
-    for provider_name, provider_version in co.model.providers_versions.items():
-        schema = _tfschema.get(
-            work_dir=co.work_dir,
-            terraform_path=co.model.terraform_path,
-            terraform_version=co.model.terraform_version,
-            provider_name=provider_name,
-            provider_version=provider_version,
-            provider_path=co.model.providers_paths[provider_name]
-        )
-        providers_py_paths[provider_name] = _generator.gen_provider_py(
-            work_dir=co.work_dir,
-            terraform_version=co.model.terraform_version,
-            provider_name=provider_name,
-            provider_version=provider_version,
-            provider_schema=schema
-        )
-
-    _generator.gen_yapytfgen(dest=co.work_dir, providers_paths=providers_py_paths)
+    co: Context = ctx.find_object(Context)

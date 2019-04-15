@@ -1,67 +1,39 @@
 import json
+import pathlib
 import shutil
 import subprocess
 import sys
-from typing import TYPE_CHECKING
 
 import click
 
-from . import _pcache
-
-if TYPE_CHECKING:
-    import pathlib
+from . import _pcache, _tfrun
 
 
 def get(
     *,
-    work_dir: "pathlib.Path",
-    terraform_path: "pathlib.Path",
+    work_dir: pathlib.Path,
+    terraform_path: pathlib.Path,
     terraform_version: str,
     provider_name: str,
-    provider_path: "pathlib.Path",
+    provider_path: pathlib.Path,
     provider_version: str,
 ) -> dict:
     key = "tfschema-{}-{}-{}".format(terraform_version, provider_name, provider_version)
 
     FNAME = "schema.json"
-    # TODO remove once this is fixed
-    PLUGIN_PATH_WORKAROUND = True
 
-    def produce(dir_path: "pathlib.Path") -> None:
+    def produce(dir_path: pathlib.Path) -> None:
         this_work_dir = work_dir.joinpath("tfschema-{}".format(provider_name))
         this_work_dir.mkdir()
 
         with this_work_dir.joinpath("main.tf.json").open("w") as f:
             json.dump({"provider": [{provider_name: {}}]}, f)
 
-        if PLUGIN_PATH_WORKAROUND:
-            # fixed in terraform commit 30672faebea0590a3a84c34127805c915db89051
-            # binaries for which are not yet published
-            # Note: this fix is incompatible with Windows due the lack of usable symlinks
-            nonlocal terraform_path
-            nonlocal provider_path
-            this_work_dir.joinpath("terraform").symlink_to(terraform_path.joinpath("terraform"))
-            terraform_path = this_work_dir
-            for i in provider_path.iterdir():
-                this_work_dir.joinpath(i.name).symlink_to(i)
-            provider_path = this_work_dir
-
-        cp = subprocess.run(
-            [
-                terraform_path.joinpath("terraform"),
-                "init",
-                "-plugin-dir",
-                provider_path,
-            ],
-            cwd=this_work_dir,
-            capture_output=True,
+        _tfrun.tf_init(
+            work_dir=this_work_dir,
+            terraform_path=terraform_path,
+            providers_paths=[provider_path]
         )
-
-        if cp.returncode:
-            sys.stderr.write(cp.stdout)
-            raise click.ClickException(
-                '"terraform init" failed with return code {}'.format(cp.returncode)
-            )
 
         cp = subprocess.run(
             [
