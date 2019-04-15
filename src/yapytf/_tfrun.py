@@ -2,7 +2,7 @@ import click
 import pathlib
 import subprocess
 import sys
-from typing import List
+from typing import Iterable
 
 # TODO remove once this is fixed
 PLUGIN_PATH_WORKAROUND = True
@@ -13,7 +13,7 @@ def tf_init(
     *,
     work_dir: pathlib.Path,
     terraform_path: pathlib.Path,
-    providers_paths: List[pathlib.Path],
+    providers_paths: Iterable[pathlib.Path],
 ) -> None:
     if PLUGIN_PATH_WORKAROUND:
         # fixed in terraform commit 30672faebea0590a3a84c34127805c915db89051

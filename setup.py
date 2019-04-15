@@ -10,11 +10,13 @@ setup(
     author_email="kshpitsa@gmail.com",
     url="https://github.com/kshpytsya/yapytf",
     install_requires=[
+        "attrs>=19.1.0,<20",
         "click>=7.0,<8",
         "click-log>=0.3.2,<1",
         "implements>=0.1.4,<1",
         "jinja2>=2.10.1,<3",
         "jsonschema>=3.0.1,<4",
+        "PyYAML>=5.1,<6",
         "requests>=2.21.0,<3",
         "tqdm>=4.31.1,<5",
         "xdgappdirs>=1.4.5,<2",

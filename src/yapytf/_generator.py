@@ -1,11 +1,13 @@
 import ast
 import keyword
 import pathlib
-from typing import List, Dict, Tuple, Union, Mapping, Generator, Iterable
+from typing import Any, List, Dict, Tuple, Union, Mapping, Generator, Iterable
 
 from . import _pcache
 
 DATA_TYPE_HINT = "Dict[str, Any]"
+
+# TODO: https://www.terraform.io/docs/configuration/resources.html#meta-arguments
 
 
 class Builder:
@@ -452,6 +454,213 @@ def python_type_assert_cond(tf_type) -> str:
     assert 0, f"Unknow Terraform type {tf_type}"
 
 
+def make_schema_class(
+    builder,
+    class_name: str,
+    schema: Dict[str, Any],
+    class_path: List[str]
+) -> str:
+    full_class_name = ".".join(class_path + [class_name])
+    class_builder = def_block(
+        builder,
+        1 if class_path else 2,
+        f"class {class_name}"
+    )
+    class_builder.line("__slots__ = (\"_data\", \"_context_thing\")")
+
+    def_block(
+        class_builder,
+        1,
+        "def __init__",
+        ["self", "data"],
+        lines=[
+            "self._data = data",
+            f"self._context_thing: \"Optional[{full_class_name}]\" = None",
+        ]
+    )
+
+    def_block(
+        class_builder,
+        1,
+        "def __enter__", ["self"],
+        f" -> \"{full_class_name}\"",
+        lines=[
+            "assert self._context_thing is None",
+            "self._context_thing = self.__class__(self._data)",
+            "return self._context_thing",
+        ]
+    )
+
+    def_block(
+        class_builder,
+        1,
+        "def __exit__",
+        ["self", "*args"],
+        lines=[
+            "assert self._context_thing is not None",
+            "self._context_thing._data = None",
+            "self._context_thing = None",
+        ]
+    )
+
+    for attr_name, attr_schema in schema.get("block", {}).get("attributes", {}).items():
+        assert attr_name.isidentifier()
+        attr_slug = "_" if keyword.iskeyword(attr_name) else ""
+
+        python_type = python_type_ann(attr_schema["type"])
+
+        def_block(
+            class_builder,
+            1,
+            f"def _validate_{attr_name}",
+            ["value"],
+            f" -> None",
+            decorators=["staticmethod"],
+            lines=[
+                "assert " + python_type_assert_cond(attr_schema["type"])
+            ]
+        )
+        def_block(
+            class_builder,
+            1,
+            f"def {attr_name}{attr_slug}",
+            ["self"],
+            f" -> Optional[{python_type}]",
+            decorators=["property"],
+            lines=[
+                f"result = self._data.get(\"{attr_name}\")",
+                "if result is not None:",
+                f"\tself._validate_{attr_name}(result)",
+                "return result"
+            ]
+        )
+
+        def_block(
+            class_builder,
+            1,
+            f"def {attr_name}{attr_slug}",
+            ["self", f"value: {python_type}"],
+            " -> None",
+            decorators=[f"{attr_name}{attr_slug}.setter"],
+            lines=[
+                f"self._validate_{attr_name}(value)",
+                f"self._data[\"{attr_name}\"] = value",
+            ]
+        )
+
+        def_block(
+            class_builder,
+            1,
+            f"def {attr_name}{attr_slug}",
+            ["self"],
+            " -> None",
+            decorators=[f"{attr_name}{attr_slug}.deleter"],
+            lines=[
+                f"self._data.pop(\"{attr_name}\", None)",
+            ]
+        )
+
+    for attr_name, attr_schema in schema.get("block", {}).get("block_types", {}).items():
+        assert attr_name.isidentifier()
+        attr_slug = "_" if keyword.iskeyword(attr_name) else ""
+
+        attr_class_name = make_schema_class(
+            class_builder,
+            f"_instance_{attr_name}",
+            attr_schema,
+            class_path + [class_name]
+        )
+
+        attr_nesting_mode = attr_schema["nesting_mode"]
+        if attr_nesting_mode == "single":
+            def_block(
+                class_builder,
+                1,
+                f"def {attr_name}{attr_slug}",
+                ["self"],
+                f" -> \"{attr_class_name}\"",
+                decorators=["property"],
+                lines=[
+                    f"return {attr_class_name}(self._data.setdefault(\"{attr_name}\", {{}}))",
+                ]
+            )
+
+            def_block(
+                class_builder,
+                1,
+                f"def {attr_name}{attr_slug}",
+                ["self", f"value: \"{attr_class_name}\""],
+                " -> None",
+                decorators=[f"{attr_name}{attr_slug}.setter"],
+                lines=[
+                    f"assert isinstance(value, {attr_class_name})",
+                    f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
+                ]
+            )
+
+            def_block(
+                class_builder,
+                1,
+                f"def {attr_name}{attr_slug}",
+                ["self"],
+                " -> None",
+                decorators=[f"{attr_name}{attr_slug}.deleter"],
+                lines=[
+                    f"self._data.pop(\"{attr_name}\", None)",
+                ]
+            )
+        elif attr_nesting_mode in {"list", "set"}:
+            attr_list_class_name = make_list_of_class(
+                builder=class_builder,
+                list_class_name=f"_list_of_{attr_name}",
+                instance_class_name=f"_instance_{attr_name}",
+                class_path=class_path + [class_name]
+            )
+            def_block(
+                class_builder,
+                1,
+                f"def {attr_name}{attr_slug}",
+                ["self"],
+                f" -> \"{attr_list_class_name}\"",
+                decorators=["property"],
+                lines=[
+                    "return {}(self._data.setdefault(\"{}\", []))".format(
+                        attr_list_class_name,
+                        attr_name
+                    )
+                ]
+            )
+
+            def_block(
+                class_builder,
+                1,
+                f"def {attr_name}{attr_slug}",
+                ["self", f"value: \"{attr_class_name}\""],
+                " -> None",
+                decorators=[f"{attr_name}{attr_slug}.setter"],
+                lines=[
+                    f"assert isinstance(value, {attr_list_class_name})",
+                    f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
+                ]
+            )
+
+            def_block(
+                class_builder,
+                1,
+                f"def {attr_name}{attr_slug}",
+                ["self"],
+                " -> None",
+                decorators=[f"{attr_name}{attr_slug}.deleter"],
+                lines=[
+                    f"self._data.pop(\"{attr_name}\", None)",
+                ]
+            )
+        else:
+            assert 0, f"Unknown Terraform nesting_mode {attr_nesting_mode}"
+
+    return full_class_name
+
+
 def gen_provider_py(
     *,
     work_dir: pathlib.Path,
@@ -481,13 +690,23 @@ def gen_provider_py(
         pschema = provider_schema["provider_schemas"][provider_name]
         builder = Builder()
         imports_block = builder.block(indented=False)
-        imports_block.line("from typing import Any, Dict, Optional")
+        imports_block.lines([
+            "import copy",
+            "from typing import Any, Dict, Iterable, List, MutableSequence, Optional, overload, Union"
+        ])
 
         def make_v1():
             KIND_TO_KEY = {
                 "data_source": "data",
                 "resource": "resource",
             }
+
+            make_schema_class(
+                builder,
+                "v1_provider",
+                pschema["provider"],
+                []
+            )
 
             for kind in ["data_source", "resource"]:
                 ns_props: Dict[str, str] = {}
@@ -521,208 +740,7 @@ def gen_provider_py(
                     )
 
                     def make_res_instance():
-                        def make_class(builder, class_name, schema, class_path) -> str:
-                            full_class_name = ".".join(class_path + [class_name])
-                            class_builder = def_block(
-                                builder,
-                                1 if class_path else 2,
-                                f"class {class_name}"
-                            )
-                            class_builder.line("__slots__ = (\"_data\", \"_context_thing\")")
-
-                            def_block(
-                                class_builder,
-                                1,
-                                "def __init__",
-                                ["self", "data"],
-                                lines=[
-                                    "self._data = data",
-                                    f"self._context_thing: \"Optional[{full_class_name}]\" = None",
-                                ]
-                            )
-
-                            def_block(
-                                class_builder,
-                                1,
-                                "def __enter__", ["self"],
-                                f" -> \"{full_class_name}\"",
-                                lines=[
-                                    "assert self._context_thing is None",
-                                    "self._context_thing = self.__class__(self._data)",
-                                    "return self._context_thing",
-                                ]
-                            )
-
-                            def_block(
-                                class_builder,
-                                1,
-                                "def __exit__",
-                                ["self", "*args"],
-                                lines=[
-                                    "assert self._context_thing is not None",
-                                    "self._context_thing._data = None",
-                                    "self._context_thing = None",
-                                ]
-                            )
-
-                            for attr_name, attr_schema in schema.get("block", {}).get("attributes", {}).items():
-                                assert attr_name.isidentifier()
-                                attr_slug = "_" if keyword.iskeyword(attr_name) else ""
-
-                                python_type = python_type_ann(attr_schema["type"])
-
-                                def_block(
-                                    class_builder,
-                                    1,
-                                    f"def _validate_{attr_name}",
-                                    ["value"],
-                                    f" -> None",
-                                    decorators=["staticmethod"],
-                                    lines=[
-                                        "assert " + python_type_assert_cond(attr_schema["type"])
-                                    ]
-                                )
-                                def_block(
-                                    class_builder,
-                                    1,
-                                    f"def {attr_name}{attr_slug}",
-                                    ["self"],
-                                    f" -> Optional[{python_type}]",
-                                    decorators=["property"],
-                                    lines=[
-                                        f"result = self._data.get(\"{attr_name}\")",
-                                        "if result is not None:",
-                                        f"\tself._validate_{attr_name}(result)",
-                                        "return result"
-                                    ]
-                                )
-
-                                def_block(
-                                    class_builder,
-                                    1,
-                                    f"def {attr_name}{attr_slug}",
-                                    ["self", f"value: {python_type}"],
-                                    " -> None",
-                                    decorators=[f"{attr_name}{attr_slug}.setter"],
-                                    lines=[
-                                        f"self._validate_{attr_name}(value)",
-                                        f"self._data[\"{attr_name}\"] = value",
-                                    ]
-                                )
-
-                                def_block(
-                                    class_builder,
-                                    1,
-                                    f"def {attr_name}{attr_slug}",
-                                    ["self"],
-                                    " -> None",
-                                    decorators=[f"{attr_name}{attr_slug}.deleter"],
-                                    lines=[
-                                        f"self._data.pop(\"{attr_name}\", None)",
-                                    ]
-                                )
-
-                            for attr_name, attr_schema in schema.get("block", {}).get("block_types", {}).items():
-                                assert attr_name.isidentifier()
-                                attr_slug = "_" if keyword.iskeyword(attr_name) else ""
-
-                                attr_class_name = make_class(
-                                    class_builder,
-                                    f"_instance_{attr_name}",
-                                    attr_schema,
-                                    class_path + [class_name]
-                                )
-
-                                attr_nesting_mode = attr_schema["nesting_mode"]
-                                if attr_nesting_mode == "single":
-                                    def_block(
-                                        class_builder,
-                                        1,
-                                        f"def {attr_name}{attr_slug}",
-                                        ["self"],
-                                        f" -> \"{attr_class_name}\"",
-                                        decorators=["property"],
-                                        lines=[
-                                            f"return {attr_class_name}(self._data.setdefault(\"{attr_name}\", {{}}))",
-                                        ]
-                                    )
-
-                                    def_block(
-                                        class_builder,
-                                        1,
-                                        f"def {attr_name}{attr_slug}",
-                                        ["self", f"value: \"{attr_class_name}\""],
-                                        " -> None",
-                                        decorators=[f"{attr_name}{attr_slug}.setter"],
-                                        lines=[
-                                            f"assert isinstance(value, {attr_class_name})",
-                                            f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
-                                        ]
-                                    )
-
-                                    def_block(
-                                        class_builder,
-                                        1,
-                                        f"def {attr_name}{attr_slug}",
-                                        ["self"],
-                                        " -> None",
-                                        decorators=[f"{attr_name}{attr_slug}.deleter"],
-                                        lines=[
-                                            f"self._data.pop(\"{attr_name}\", None)",
-                                        ]
-                                    )
-                                elif attr_nesting_mode in {"list", "set"}:
-                                    attr_list_class_name = make_list_of_class(
-                                        builder=class_builder,
-                                        list_class_name=f"_list_of_{attr_name}",
-                                        instance_class_name=f"_instance_{attr_name}",
-                                        class_path=class_path + [class_name]
-                                    )
-                                    def_block(
-                                        class_builder,
-                                        1,
-                                        f"def {attr_name}{attr_slug}",
-                                        ["self"],
-                                        f" -> \"{attr_list_class_name}\"",
-                                        decorators=["property"],
-                                        lines=[
-                                            "return {}(self._data.setdefault(\"{}\", []))".format(
-                                                attr_list_class_name,
-                                                attr_name
-                                            )
-                                        ]
-                                    )
-
-                                    def_block(
-                                        class_builder,
-                                        1,
-                                        f"def {attr_name}{attr_slug}",
-                                        ["self", f"value: \"{attr_class_name}\""],
-                                        " -> None",
-                                        decorators=[f"{attr_name}{attr_slug}.setter"],
-                                        lines=[
-                                            f"assert isinstance(value, {attr_list_class_name})",
-                                            f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
-                                        ]
-                                    )
-
-                                    def_block(
-                                        class_builder,
-                                        1,
-                                        f"def {attr_name}{attr_slug}",
-                                        ["self"],
-                                        " -> None",
-                                        decorators=[f"{attr_name}{attr_slug}.deleter"],
-                                        lines=[
-                                            f"self._data.pop(\"{attr_name}\", None)",
-                                        ]
-                                    )
-                                else:
-                                    assert 0, f"Unknown Terraform nesting_mode {attr_nesting_mode}"
-
-                            return full_class_name
-
-                        make_class(module_builder, "Instance", rschema, [])
+                        make_schema_class(module_builder, "Instance", rschema, [])
 
                     make_res_instance()
 
@@ -752,7 +770,7 @@ def gen_yapytfgen(
     module_fname = module_dir.joinpath("__init__.py")
     builder = Builder()
 
-    builder.line("from typing import Optional, Dict, Any")
+    builder.line("from typing import Any, Dict, Optional")
     builder.lines([
         f"from . import {provider_name} as _{provider_name}"
         for provider_name in providers_paths

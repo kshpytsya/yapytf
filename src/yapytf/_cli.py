@@ -1,28 +1,30 @@
 import inspect
+import importlib
 import json
 import logging
 import pathlib
 import runpy
 import shutil
 import sys
+import subprocess
 import tempfile
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 import click
 import click_log
 import jsonschema
+import yaml
 from implements import implements
 
-from . import _generator, _hashigetter, _tfschema
-from .cfginterface import IConfiguration
+from . import _generator, _hashigetter, _tfrun, _tfschema, cfginterface
 
 logger = logging.getLogger(__name__)
 click_log.basic_config(logger)
 
 
 # Per https://stackoverflow.com/questions/17211078/how-to-temporarily-modify-sys-path-in-python
-class AddPath:
-    def __init__(self, path):
+class AddSysPath:
+    def __init__(self, path: str):
         self.path = path
 
     def __enter__(self):
@@ -39,11 +41,16 @@ class ConfigurationBase:
     def schema(self, schema: Dict[str, Any]) -> None:
         pass
 
+    def state_backend_cfg(self, cfg: cfginterface.StateBackendConfiguration) -> None:
+        pass
+
 
 class Model:
     versions: Mapping
     _terraform_path: Optional[pathlib.Path]
     _providers_paths: Optional[Mapping[str, pathlib.Path]]
+    _state_backend_cfg: cfginterface.StateBackendConfiguration
+    _model_params: Dict[str, Any]
 
     def __init__(
         self,
@@ -52,7 +59,7 @@ class Model:
         model_params: dict,
         model_class: str,
     ):
-        with AddPath(str(path.parent)):
+        with AddSysPath(str(path.parent)):
             logger.debug("running %s, sys.path=%s", path, sys.path)
             py = runpy.run_path(str(path))
 
@@ -65,8 +72,8 @@ class Model:
         if not inspect.isclass(class_):
             raise click.ClickException(f'"{model_class}" is not defined or is not a class')
 
-        adapted_class = implements(IConfiguration)(type(model_class, (class_, ConfigurationBase), {}))
-        self.model_obj = adapted_class()
+        adapted_class = implements(cfginterface.IConfiguration)(type(model_class, (class_, ConfigurationBase), {}))
+        self.model_obj: cfginterface.IConfiguration = adapted_class()
 
         schema: Dict[str, Any] = {
             "$schema": "http://json-schema.org/schema#",
@@ -82,11 +89,19 @@ class Model:
         except jsonschema.exceptions.ValidationError as e:
             raise click.ClickException(e)
 
+        self._model_params = model_params
+
         self.versions = dict(providers=dict())
         self.model_obj.versions(self.versions)
+        self._state_backend_cfg = cfginterface.StateBackendConfiguration()
+        self.model_obj.state_backend_cfg(self._state_backend_cfg)
 
         self._terraform_path = None
         self._providers_paths = None
+
+    @property
+    def state_backend_cfg(self) -> cfginterface.StateBackendConfiguration:
+        return self._state_backend_cfg
 
     @property
     def terraform_version(self) -> str:
@@ -142,6 +157,85 @@ class Model:
             )
 
         _generator.gen_yapytfgen(module_dir=module_dir, providers_paths=providers_py_paths)
+
+    def produce_tf_files(
+        self,
+        *,
+        dest: pathlib.Path,
+        build_cb: Optional[Callable[[Dict], None]] = None
+    ):
+        def write(path: pathlib.Path, data) -> None:
+            with path.joinpath("main.tf.json").open("w") as f:
+                json.dump(data, f, indent=4, sort_keys=True)
+
+            with path.joinpath("debug.tf.yaml").open("w") as f:
+                yaml.dump(data, default_flow_style=False, stream=f)
+
+        root_data = {
+            "terraform": {
+                "backend": {
+                    self.state_backend_cfg.name: self.state_backend_cfg.cfg_vars
+                }
+            },
+            "module": {
+                "body": {
+                    "source": "./body"
+                }
+            }
+        }
+
+        write(dest, root_data)
+
+        body_data: Dict[str, Any] = {}
+
+        if build_cb:
+            build_cb(body_data)
+
+        body_path: pathlib.Path = dest.joinpath("body")
+        body_path.mkdir()
+        write(body_path, body_data)
+
+    def prepare_step(
+        self,
+        *,
+        step_dir: pathlib.Path,
+        step_data: Any,
+    ) -> None:
+        pass
+
+    def prepare_steps(
+        self,
+        *,
+        work_dir: pathlib.Path
+    ) -> None:
+        module_dir = work_dir.joinpath("yapytfgen")
+        module_dir.mkdir()
+
+        self.gen_yapytfgen(
+            module_dir=module_dir,
+            work_dir=work_dir
+        )
+
+        with AddSysPath(str(work_dir)):
+            yapytfgen_module = importlib.import_module("yapytfgen")
+
+        yapytfgen_model_class = getattr(yapytfgen_module, "model")
+
+        def build(data: Dict[Any, str]) -> None:
+            yapytfgen_model = yapytfgen_model_class(data)
+            self.model_obj.build(
+                model=yapytfgen_model,
+                data=self._model_params,
+                step_data=None
+            )
+
+        self.produce_tf_files(dest=work_dir, build_cb=build)
+
+        _tfrun.tf_init(
+            work_dir=work_dir,
+            terraform_path=self.terraform_path,
+            providers_paths=self.providers_paths.values()
+        )
 
 
 class Context:
@@ -277,3 +371,18 @@ def lint(ctx: click.Context, **opts):
     Validate model file
     """
     co: Context = ctx.find_object(Context)
+
+    co.model.prepare_steps(work_dir=co.work_dir)
+
+
+@main.command()
+@click.pass_context
+@click.argument(
+    "args",
+    nargs=-1
+)
+def rawtf(ctx: click.Context, **opts):
+    """
+    Execute raw terraform commands
+    """
+    # co: Context = ctx.find_object(Context)
