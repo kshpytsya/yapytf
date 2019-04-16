@@ -41,7 +41,10 @@ def tf_init(
     )
 
     if cp.returncode:
-        sys.stderr.write(cp.stdout)
+        sys.stderr.write("============== terraform output ==============\n")
+        sys.stderr.buffer.write(cp.stdout)
+        sys.stderr.buffer.write(cp.stderr)
+        sys.stderr.write("==============================================\n")
         raise click.ClickException(
             '"terraform init" failed with return code {}'.format(cp.returncode)
         )

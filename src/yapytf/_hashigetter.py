@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 def make_url(product: str, ver: str) -> str:
     baseurl = os.environ.get("HASHI_RELEASES", "https://releases.hashicorp.com")
-    if ver.endswith("-dev"):
+    if "-dev" in ver:
         baseurl = os.environ.get("HASHI_DEV_RELEASES", baseurl)
 
     return "{baseurl}/{product}/{ver}/{product}_{ver}_{goos}_{goarch}.zip".format(

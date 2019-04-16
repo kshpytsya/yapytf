@@ -6,9 +6,8 @@ import pathlib
 import runpy
 import shutil
 import sys
-import subprocess
 import tempfile
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Generator, Mapping, Optional
 
 import click
 import click_log
@@ -27,10 +26,10 @@ class AddSysPath:
     def __init__(self, path: str):
         self.path = path
 
-    def __enter__(self):
+    def __enter__(self) -> None:
         sys.path.insert(0, self.path)
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, *args: Any) -> None:
         try:
             sys.path.remove(self.path)
         except ValueError:
@@ -46,19 +45,25 @@ class ConfigurationBase:
 
 
 class Model:
-    versions: Mapping
+    versions: Dict[str, Any]
     _terraform_path: Optional[pathlib.Path]
     _providers_paths: Optional[Mapping[str, pathlib.Path]]
+    _providers_schemas: Optional[Mapping[str, Dict[str, Any]]]
     _state_backend_cfg: cfginterface.StateBackendConfiguration
     _model_params: Dict[str, Any]
+    _work_dir: pathlib.Path
+    _resource_type_to_provider: Optional[Dict[str, Dict[str, str]]]
 
     def __init__(
         self,
         *,
         path: pathlib.Path,
-        model_params: dict,
+        model_params: Dict[str, Any],
         model_class: str,
+        work_dir: pathlib.Path,
     ):
+        self._work_dir = work_dir
+
         with AddSysPath(str(path.parent)):
             logger.debug("running %s, sys.path=%s", path, sys.path)
             py = runpy.run_path(str(path))
@@ -98,6 +103,8 @@ class Model:
 
         self._terraform_path = None
         self._providers_paths = None
+        self._providers_schemas = None
+        self._resource_type_to_provider = None
 
     @property
     def state_backend_cfg(self) -> cfginterface.StateBackendConfiguration:
@@ -128,11 +135,41 @@ class Model:
 
         return self._providers_paths
 
+    @property
+    def providers_schemas(self) -> Mapping[str, Dict[str, Any]]:
+        if self._providers_schemas is None:
+            self._providers_schemas = {
+                provider_name: _tfschema.get(
+                    work_dir=self._work_dir,
+                    terraform_path=self.terraform_path,
+                    terraform_version=self.terraform_version,
+                    provider_name=provider_name,
+                    provider_version=provider_version,
+                    provider_path=self.providers_paths[provider_name]
+                )
+                for provider_name, provider_version in self.providers_versions.items()
+            }
+
+        return self._providers_schemas
+
+    @property
+    def resource_type_to_provider(self) -> Dict[str, Dict[str, str]]:
+        if self._resource_type_to_provider is None:
+            self._resource_type_to_provider = {
+                kind_key: {
+                    resource_type: provider_name
+                    for provider_name, provider_schema in self.providers_schemas.items()
+                    for resource_type in provider_schema["provider_schemas"][provider_name].get(f"{kind}_schemas", {})
+                }
+                for kind, kind_key in _generator.KIND_TO_KEY.items()
+            }
+
+        return self._resource_type_to_provider
+
     def gen_yapytfgen(
         self,
         *,
         module_dir: pathlib.Path,
-        work_dir: pathlib.Path
     ) -> None:
         logger.debug("terraform_path: %s", self.terraform_path)
         logger.debug("providers_paths: %s", self.providers_paths)
@@ -140,20 +177,12 @@ class Model:
         providers_py_paths: Dict[str, pathlib.Path] = {}
 
         for provider_name, provider_version in self.providers_versions.items():
-            schema = _tfschema.get(
-                work_dir=work_dir,
-                terraform_path=self.terraform_path,
-                terraform_version=self.terraform_version,
-                provider_name=provider_name,
-                provider_version=provider_version,
-                provider_path=self.providers_paths[provider_name]
-            )
             providers_py_paths[provider_name] = _generator.gen_provider_py(
-                work_dir=work_dir,
+                work_dir=self._work_dir,
                 terraform_version=self.terraform_version,
                 provider_name=provider_name,
                 provider_version=provider_version,
-                provider_schema=schema
+                provider_schema=self.providers_schemas[provider_name]
             )
 
         _generator.gen_yapytfgen(module_dir=module_dir, providers_paths=providers_py_paths)
@@ -162,9 +191,9 @@ class Model:
         self,
         *,
         dest: pathlib.Path,
-        build_cb: Optional[Callable[[Dict], None]] = None
-    ):
-        def write(path: pathlib.Path, data) -> None:
+        build_cb: Optional[Callable[[Dict[str, Any]], None]] = None
+    ) -> None:
+        def write(path: pathlib.Path, data: Dict[str, Any]) -> None:
             with path.joinpath("main.tf.json").open("w") as f:
                 json.dump(data, f, indent=4, sort_keys=True)
 
@@ -205,34 +234,67 @@ class Model:
 
     def prepare_steps(
         self,
-        *,
-        work_dir: pathlib.Path
     ) -> None:
-        module_dir = work_dir.joinpath("yapytfgen")
+        module_dir = self._work_dir.joinpath("yapytfgen")
         module_dir.mkdir()
 
         self.gen_yapytfgen(
             module_dir=module_dir,
-            work_dir=work_dir
         )
 
-        with AddSysPath(str(work_dir)):
+        with AddSysPath(str(self._work_dir)):
             yapytfgen_module = importlib.import_module("yapytfgen")
 
         yapytfgen_model_class = getattr(yapytfgen_module, "model")
 
-        def build(data: Dict[Any, str]) -> None:
-            yapytfgen_model = yapytfgen_model_class(data)
+        def build(data: Dict[str, Any]) -> None:
+            d: Dict[str, Any] = {
+                "provider": {
+                    provider_name: {'': {}}
+                    for provider_name in self.providers_versions
+                }
+            }
+
+            yapytfgen_model = yapytfgen_model_class(d)
             self.model_obj.build(
                 model=yapytfgen_model,
                 data=self._model_params,
                 step_data=None
             )
 
-        self.produce_tf_files(dest=work_dir, build_cb=build)
+            assert "provider" not in d["tf"]
+            data["provider"] = [
+                {
+                    provider_type:
+                    {
+                        **provider_data,
+                        **({"alias": provider_alias} if provider_alias else {})
+                    }
+                }
+                for provider_type, provider_aliases in d["provider"].items()
+                for provider_alias, provider_data in provider_aliases.items()
+            ]
+
+            def drop_empty(d: Dict[Any, Any]) -> Generator[Any, None, None]:
+                return ((k, v) for k, v in d.items() if v)
+
+            data.update(drop_empty({k: dict(drop_empty(v)) for k, v in d["tf"].items()}))
+
+            # expand "provider" properties
+            for kind in ["data", "resource"]:
+                resource_type_to_provider = self.resource_type_to_provider[kind]
+                for resource_type, resources in data.get(kind, {}).items():
+                    for resource_name, resource_data in resources.items():
+                        provider_alias = resource_data.get("provider")
+                        if provider_alias is not None:
+                            provider_type = resource_type_to_provider[resource_type]
+                            assert provider_alias in d["provider"][provider_type]
+                            resource_data["provider"] = f"{provider_type}.{provider_alias}"
+
+        self.produce_tf_files(dest=self._work_dir, build_cb=build)
 
         _tfrun.tf_init(
-            work_dir=work_dir,
+            work_dir=self._work_dir,
             terraform_path=self.terraform_path,
             providers_paths=self.providers_paths.values()
         )
@@ -302,7 +364,7 @@ def main(ctx: click.Context, **opts):
     co.work_dir = pathlib.Path(tempfile.mkdtemp(prefix="yapytf."))
 
     @ctx.call_on_close
-    def cleanup_tmp_dir():
+    def cleanup_tmp_dir() -> None:
         if opts["keep_work"]:
             click.echo('Keeping working directory "{}"'.format(co.work_dir), err=True)
         else:
@@ -316,6 +378,7 @@ def main(ctx: click.Context, **opts):
         path=model_path,
         model_params=model_params,
         model_class=opts["class"],
+        work_dir=co.work_dir,
     )
 
 
@@ -361,7 +424,7 @@ def gen(ctx: click.Context, **opts):
     marker_file.touch()
     module_dir.joinpath(".gitignore").write_text("*\n")
 
-    co.model.gen_yapytfgen(module_dir=module_dir, work_dir=co.work_dir)
+    co.model.gen_yapytfgen(module_dir=module_dir)
 
 
 @main.command()
@@ -372,7 +435,7 @@ def lint(ctx: click.Context, **opts):
     """
     co: Context = ctx.find_object(Context)
 
-    co.model.prepare_steps(work_dir=co.work_dir)
+    co.model.prepare_steps()
 
 
 @main.command()
