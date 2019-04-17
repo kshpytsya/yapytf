@@ -115,6 +115,9 @@ def def_block(
     else:
         blanks_before, blanks_after = blanks
 
+    if suffix:
+        suffix = f" -> {suffix}"
+
     builder.blanks(blanks_before)
 
     for i in decorators:
@@ -169,7 +172,7 @@ def make_bag_of_class(
         1,
         "def __init__",
         ["self", f"data: {DATA_TYPE_HINT}"],
-        " -> None",
+        "None",
         lines=[
             f"self._data: {DATA_TYPE_HINT} = data" + "".join(f".setdefault(\"{i}\", {{}})" for i in data_path),
         ]
@@ -179,7 +182,7 @@ def make_bag_of_class(
         1,
         "def __delitem__",
         ["self", "key: str"],
-        " -> None",
+        "None",
         lines=[
             "self._data.__delitem__(key)",
         ]
@@ -189,7 +192,7 @@ def make_bag_of_class(
         1,
         "def __getitem__",
         ["self", "key: str"],
-        f" -> \"{full_instance_class_name}\"",
+        f"\"{full_instance_class_name}\"",
         lines=[
             # TODO validate key
             f"return {full_instance_class_name}(self._data.setdefault(key, {{}}))",
@@ -200,16 +203,16 @@ def make_bag_of_class(
         1,
         "def __iter__",
         ["self"],
-        " -> Iterator[str]",
+        "Iterator[str]",
         lines=["return self._data.__iter__()"]
     )
-    def_block(class_builder, 1, "def __len__", ["self"], " -> int", lines=["return len(self._data)"])
+    def_block(class_builder, 1, "def __len__", ["self"], "int", lines=["return len(self._data)"])
     def_block(
         class_builder,
         1,
         "def __setitem__",
         ["self", "key: str", f"value: \"{full_instance_class_name}\""],
-        " -> None",
+        "None",
         lines=[
             # TODO validate key
             f"if not isinstance(value, {full_instance_class_name}):",
@@ -225,7 +228,7 @@ def make_bag_of_class(
             1,
             f"def {prop_name}",
             ["self"],
-            f" -> \"{full_instance_class_name}\"",
+            f"\"{full_instance_class_name}\"",
             decorators=["property"],
             lines=[f"return self[{repr(prop_key)}]"]
         )
@@ -252,8 +255,8 @@ def make_list_of_class(
         class_builder,
         1,
         "def __init__",
-        ["self", "data: List"],
-        " -> None",
+        ["self", "data: List[Any]"],
+        "None",
         lines=["self._data = data"]
     )
     def_block(
@@ -261,7 +264,7 @@ def make_list_of_class(
         1,
         "def __delitem__",
         ["self", "idx: Union[int, slice]"],
-        " -> None",
+        "None",
         lines=["self._data.__delitem__(idx)"]
     )
     def_block(
@@ -269,7 +272,7 @@ def make_list_of_class(
         1,
         "def __getitem__",
         ["self", "idx: int"],
-        f" -> \"{full_instance_class_name}\"",
+        f"\"{full_instance_class_name}\"",
         decorators=["overload"],
         lines=["..."]
     )
@@ -278,7 +281,7 @@ def make_list_of_class(
         1,
         "def __getitem__",
         ["self", "idx: slice"],
-        f" -> \"MutableSequence[{full_instance_class_name}]\"",
+        f"\"MutableSequence[{full_instance_class_name}]\"",
         decorators=["overload"],
         lines=["..."]
     )
@@ -286,7 +289,8 @@ def make_list_of_class(
         class_builder,
         1,
         "def __getitem__",
-        ["self", "idx"],
+        ["self", "idx: Union[int, slice]"],
+        f"Union[\"{full_instance_class_name}\", \"MutableSequence[{full_instance_class_name}]\"]",
         lines=[
             "if isinstance(idx, slice):",
             f"\treturn [{full_instance_class_name}(i) for i in self._data[idx]]",
@@ -294,13 +298,13 @@ def make_list_of_class(
             f"\treturn {full_instance_class_name}(self._data[idx])",
         ]
     )
-    def_block(class_builder, 1, "def __len__", ["self"], lines=["return len(self._data)"])
+    def_block(class_builder, 1, "def __len__", ["self"], "int", lines=["return len(self._data)"])
     def_block(
         class_builder,
         1,
         "def __setitem__",
         ["self", "idx: int", f"value: \"{full_instance_class_name}\""],
-        f" -> None",
+        f"None",
         decorators=["overload"],
         lines=["..."]
     )
@@ -309,7 +313,7 @@ def make_list_of_class(
         1,
         "def __setitem__",
         ["self", "idx: slice", f"value: Iterable[\"{full_instance_class_name}\"]"],
-        " -> None",
+        "None",
         decorators=["overload"],
         lines=["..."]
     )
@@ -317,13 +321,17 @@ def make_list_of_class(
         class_builder,
         1,
         "def __setitem__",
-        ["self", "idx", "value"],
-        " -> None",
+        [
+            "self",
+            "idx: Union[int, slice]",
+            f"value: Union[\"{full_instance_class_name}\", Iterable[\"{full_instance_class_name}\"]]"
+        ],
+        "None",
         lines=[
-            "if isinstance(idx, slice):",
+            "if isinstance(value, Iterable):",
             f"\tfor i, j in enumerate(value):",
             f"\t\tif not isinstance(j, {full_instance_class_name}):",
-            f"\t\t\ttraise TypeError(\"expect {full_instance_class_name}, got {{type(j).__name__}} at index {{i}}\")",
+            f"\t\t\traise TypeError(\"expect {full_instance_class_name}, got {{type(j).__name__}} at index {{i}}\")",
             f"\tself._data[idx] = [copy.deepcopy(i._data) for i in value]",
             "else:",
             f"\tif not isinstance(value, {full_instance_class_name}):",
@@ -336,7 +344,7 @@ def make_list_of_class(
         1,
         "def insert",
         ["self", "index: int", f"object: \"{full_instance_class_name}\""],
-        " -> None",
+        "None",
         decorators=["overload"],
         lines=["..."]
     )
@@ -345,7 +353,7 @@ def make_list_of_class(
         1,
         "def insert",
         ["self", "index: int"],
-        " -> None",
+        "None",
         decorators=["overload"],
         lines=["..."]
     )
@@ -353,8 +361,8 @@ def make_list_of_class(
         class_builder,
         1,
         "def insert",
-        ["self", "index", "object=None"],
-        " -> None",
+        ["self", "index: int", f"object: Optional[\"{full_instance_class_name}\"] = None"],
+        "None",
         lines=[
             "if object is None:",
             "\tself._data.insert(index, {})",
@@ -368,8 +376,8 @@ def make_list_of_class(
         class_builder,
         1,
         "def insert_new",
-        ["self", "idx"],
-        f" -> \"{full_instance_class_name}\"",
+        ["self", "idx: int"],
+        f"\"{full_instance_class_name}\"",
         lines=[
             f"data: {DATA_TYPE_HINT} = {{}}",
             "self._data.insert(idx, data)",
@@ -381,7 +389,7 @@ def make_list_of_class(
         1,
         "def append_new",
         ["self"],
-        f" -> \"{full_instance_class_name}\"",
+        f"\"{full_instance_class_name}\"",
         lines=["return self.insert_new(len(self))"]
     )
 
@@ -445,7 +453,7 @@ def make_ns_class(
         1,
         "def __init__",
         ["self", f"data: {data_type}"],
-        " -> None"
+        "None"
     )
     init_block.line("self._data = data")
 
@@ -459,7 +467,7 @@ def make_ns_class(
             1,
             f"def {prop_name}{prop_name_slug}",
             ["self"],
-            f" -> \"{prop_type}\"",
+            f"\"{prop_type}\"",
             decorators=["property"],
             lines=[
                 f"if self._prop_{prop_name} is None:",
@@ -531,7 +539,7 @@ def make_schema_class(
         1,
         "def __init__",
         ["self", f"data: {DATA_TYPE_HINT}"],
-        " -> None",
+        "None",
         lines=[
             "self._data = data",
             f"self._context_thing: \"Optional[{full_class_name}]\" = None",
@@ -542,7 +550,7 @@ def make_schema_class(
         class_builder,
         1,
         "def __enter__", ["self"],
-        f" -> \"{full_class_name}\"",
+        f"\"{full_class_name}\"",
         lines=[
             "assert self._context_thing is None",
             "self._context_thing = self.__class__(self._data)",
@@ -555,7 +563,7 @@ def make_schema_class(
         1,
         "def __exit__",
         ["self", "*args: Any"],
-        " -> None",
+        "None",
         lines=[
             "assert self._context_thing is not None",
             "self._context_thing._data = None  # type: ignore",
@@ -578,7 +586,7 @@ def make_schema_class(
                 1,
                 f"def _validate_{attr_name}",
                 ["value: Any"],
-                f" -> {python_type}",
+                f"{python_type}",
                 decorators=["staticmethod"],
                 lines=[
                     f"if not({python_type_assert_cond(attr_schema['type'])}):",
@@ -591,7 +599,7 @@ def make_schema_class(
                 1,
                 f"def {attr_name}{attr_slug}",
                 ["self"],
-                f" -> Optional[{python_type}]",
+                f"Optional[{python_type}]",
                 decorators=["property"],
                 lines=[
                     f"result = self._data.get(\"{attr_name}\")",
@@ -607,7 +615,7 @@ def make_schema_class(
                 1,
                 f"def {attr_name}{attr_slug}",
                 ["self", f"value: {python_type}"],
-                " -> None",
+                "None",
                 decorators=[f"{attr_name}{attr_slug}.setter"],
                 lines=[
                     f"self._validate_{attr_name}(value)",
@@ -620,7 +628,7 @@ def make_schema_class(
                 1,
                 f"def {attr_name}{attr_slug}",
                 ["self"],
-                " -> None",
+                "None",
                 decorators=[f"{attr_name}{attr_slug}.deleter"],
                 lines=[
                     f"self._data.pop(\"{attr_name}\", None)",
@@ -645,7 +653,7 @@ def make_schema_class(
                     1,
                     f"def {attr_name}{attr_slug}",
                     ["self"],
-                    f" -> \"{attr_class_name}\"",
+                    f"\"{attr_class_name}\"",
                     decorators=["property"],
                     lines=[
                         f"return {attr_class_name}(self._data.setdefault(\"{attr_name}\", {{}}))",
@@ -657,7 +665,7 @@ def make_schema_class(
                     1,
                     f"def {attr_name}{attr_slug}",
                     ["self", f"value: \"{attr_class_name}\""],
-                    " -> None",
+                    "None",
                     decorators=[f"{attr_name}{attr_slug}.setter"],
                     lines=[
                         f"if not isinstance(value, {attr_class_name}):",
@@ -671,7 +679,7 @@ def make_schema_class(
                     1,
                     f"def {attr_name}{attr_slug}",
                     ["self"],
-                    " -> None",
+                    "None",
                     decorators=[f"{attr_name}{attr_slug}.deleter"],
                     lines=[
                         f"self._data.pop(\"{attr_name}\", None)",
@@ -689,7 +697,7 @@ def make_schema_class(
                     1,
                     f"def {attr_name}{attr_slug}",
                     ["self"],
-                    f" -> \"{attr_list_class_name}\"",
+                    f"\"{attr_list_class_name}\"",
                     decorators=["property"],
                     lines=[
                         "return {}(self._data.setdefault(\"{}\", []))".format(
@@ -704,7 +712,7 @@ def make_schema_class(
                     1,
                     f"def {attr_name}{attr_slug}",
                     ["self", f"value: \"{attr_class_name}\""],
-                    " -> None",
+                    "None",
                     decorators=[f"{attr_name}{attr_slug}.setter"],
                     lines=[
                         f"if not isinstance(value, {attr_list_class_name}):",
@@ -718,7 +726,7 @@ def make_schema_class(
                     1,
                     f"def {attr_name}{attr_slug}",
                     ["self"],
-                    " -> None",
+                    "None",
                     decorators=[f"{attr_name}{attr_slug}.deleter"],
                     lines=[
                         f"self._data.pop(\"{attr_name}\", None)",
