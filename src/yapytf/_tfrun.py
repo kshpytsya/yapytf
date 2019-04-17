@@ -5,7 +5,7 @@ import sys
 from typing import Iterable
 
 # TODO remove once this is fixed
-PLUGIN_PATH_WORKAROUND = True
+PLUGIN_PATH_WORKAROUND = False  # True
 TF_BIN = "terraform"
 
 

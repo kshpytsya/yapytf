@@ -169,8 +169,9 @@ def make_bag_of_class(
         1,
         "def __init__",
         ["self", f"data: {DATA_TYPE_HINT}"],
+        " -> None",
         lines=[
-            "self._data = data" + "".join(f".setdefault(\"{i}\", {{}})" for i in data_path),
+            f"self._data: {DATA_TYPE_HINT} = data" + "".join(f".setdefault(\"{i}\", {{}})" for i in data_path),
         ]
     )
     def_block(
@@ -178,6 +179,7 @@ def make_bag_of_class(
         1,
         "def __delitem__",
         ["self", "key: str"],
+        " -> None",
         lines=[
             "self._data.__delitem__(key)",
         ]
@@ -193,16 +195,25 @@ def make_bag_of_class(
             f"return {full_instance_class_name}(self._data.setdefault(key, {{}}))",
         ]
     )
-    def_block(class_builder, 1, "def __iter__", ["self"], lines=["return self._data.__iter__()"])
-    def_block(class_builder, 1, "def __len__", ["self"], lines=["return len(self._data)"])
+    def_block(
+        class_builder,
+        1,
+        "def __iter__",
+        ["self"],
+        " -> Iterator[str]",
+        lines=["return self._data.__iter__()"]
+    )
+    def_block(class_builder, 1, "def __len__", ["self"], " -> int", lines=["return len(self._data)"])
     def_block(
         class_builder,
         1,
         "def __setitem__",
         ["self", "key: str", f"value: \"{full_instance_class_name}\""],
+        " -> None",
         lines=[
             # TODO validate key
-            f"assert isinstance(value, {full_instance_class_name})",
+            f"if not isinstance(value, {full_instance_class_name}):",
+            f"\traise TypeError(\"expect {full_instance_class_name}, got {{type(value).__name__}}\")",
             "self._data[key] = copy.deepcopy(value._data)",
         ]
     )
@@ -242,6 +253,7 @@ def make_list_of_class(
         1,
         "def __init__",
         ["self", "data: List"],
+        " -> None",
         lines=["self._data = data"]
     )
     def_block(
@@ -249,6 +261,7 @@ def make_list_of_class(
         1,
         "def __delitem__",
         ["self", "idx: Union[int, slice]"],
+        " -> None",
         lines=["self._data.__delitem__(idx)"]
     )
     def_block(
@@ -296,7 +309,7 @@ def make_list_of_class(
         1,
         "def __setitem__",
         ["self", "idx: slice", f"value: Iterable[\"{full_instance_class_name}\"]"],
-        f" -> None",
+        " -> None",
         decorators=["overload"],
         lines=["..."]
     )
@@ -308,10 +321,13 @@ def make_list_of_class(
         " -> None",
         lines=[
             "if isinstance(idx, slice):",
-            f"\tassert all(isinstance(i, {full_instance_class_name}) for i in value)",
+            f"\tfor i, j in enumerate(value):",
+            f"\t\tif not isinstance(j, {full_instance_class_name}):",
+            f"\t\t\ttraise TypeError(\"expect {full_instance_class_name}, got {{type(j).__name__}} at index {{i}}\")",
             f"\tself._data[idx] = [copy.deepcopy(i._data) for i in value]",
             "else:",
-            f"\tassert isinstance(value, {full_instance_class_name})",
+            f"\tif not isinstance(value, {full_instance_class_name}):",
+            f"\t\traise TypeError(\"expect {full_instance_class_name}, got {{type(value).__name__}}\")",
             "\tself._data[idx] = copy.deepcopy(value._data)",
         ]
     )
@@ -343,7 +359,8 @@ def make_list_of_class(
             "if object is None:",
             "\tself._data.insert(index, {})",
             "else:",
-            f"\tassert isinstance(object, {full_instance_class_name})",
+            f"\tif not isinstance(object, {full_instance_class_name}):",
+            f"\t\traise TypeError(\"expect {full_instance_class_name}, got {{type(object).__name__}}\")",
             "\tself._data.insert(index, copy.deepcopy(object._data))",
         ]
     )
@@ -513,7 +530,8 @@ def make_schema_class(
         class_builder,
         1,
         "def __init__",
-        ["self", "data"],
+        ["self", f"data: {DATA_TYPE_HINT}"],
+        " -> None",
         lines=[
             "self._data = data",
             f"self._context_thing: \"Optional[{full_class_name}]\" = None",
@@ -536,16 +554,20 @@ def make_schema_class(
         class_builder,
         1,
         "def __exit__",
-        ["self", "*args"],
+        ["self", "*args: Any"],
+        " -> None",
         lines=[
             "assert self._context_thing is not None",
-            "self._context_thing._data = None",
+            "self._context_thing._data = None  # type: ignore",
             "self._context_thing = None",
         ]
     )
 
     for schema in schemas:
         for attr_name, attr_schema in schema.get("block", {}).get("attributes", {}).items():
+            if attr_schema.get("computed", False):
+                continue
+
             assert attr_name.isidentifier()
             attr_slug = "_" if keyword.iskeyword(attr_name) else ""
 
@@ -555,11 +577,13 @@ def make_schema_class(
                 class_builder,
                 1,
                 f"def _validate_{attr_name}",
-                ["value"],
-                f" -> None",
+                ["value: Any"],
+                f" -> {python_type}",
                 decorators=["staticmethod"],
                 lines=[
-                    "assert " + python_type_assert_cond(attr_schema["type"])
+                    f"if not({python_type_assert_cond(attr_schema['type'])}):",
+                    f"\traise TypeError(\"expect {python_type}, got {{value!r}}\")",
+                    "return value"
                 ]
             )
             def_block(
@@ -571,9 +595,10 @@ def make_schema_class(
                 decorators=["property"],
                 lines=[
                     f"result = self._data.get(\"{attr_name}\")",
-                    "if result is not None:",
-                    f"\tself._validate_{attr_name}(result)",
-                    "return result"
+                    "if result is None:",
+                    f"\treturn self._validate_{attr_name}(result)",
+                    "else:",
+                    f"\treturn None"
                 ]
             )
 
@@ -635,7 +660,8 @@ def make_schema_class(
                     " -> None",
                     decorators=[f"{attr_name}{attr_slug}.setter"],
                     lines=[
-                        f"assert isinstance(value, {attr_class_name})",
+                        f"if not isinstance(value, {attr_class_name}):",
+                        f"\traise TypeError(\"expect {attr_class_name}, got {{type(value).__name__}}\")",
                         f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
                     ]
                 )
@@ -681,7 +707,8 @@ def make_schema_class(
                     " -> None",
                     decorators=[f"{attr_name}{attr_slug}.setter"],
                     lines=[
-                        f"assert isinstance(value, {attr_list_class_name})",
+                        f"if not isinstance(value, {attr_list_class_name}):",
+                        f"\traise TypeError(\"expect {attr_list_class_name}, got {{type(value).__name__}}\")",
                         f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
                     ]
                 )
@@ -734,7 +761,8 @@ def gen_provider_py(
         imports_block = builder.block(indented=False)
         imports_block.lines([
             "import copy",
-            "from typing import Any, Dict, Iterable, List, MutableMapping, MutableSequence, Optional, overload, Union"
+            "from typing import cast, Any, Dict, Iterable, Iterator, "
+            + "List, MutableMapping, MutableSequence, Optional, overload, Union"
         ])
 
         def make_v1() -> None:
@@ -769,7 +797,7 @@ def gen_provider_py(
 
                     module_builder.lines([
                         "import copy",
-                        "from typing import overload, Iterable, Optional, MutableMapping, "
+                        "from typing import cast, overload, Iterable, Iterator, Optional, MutableMapping, "
                         + "MutableSequence, List, Dict, Any, Union"
                     ])
                     module_builder.blanks(1)
