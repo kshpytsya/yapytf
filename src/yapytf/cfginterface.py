@@ -24,7 +24,12 @@ class IConfiguration(Interface):
     def versions(self, versions: Dict[str, Any]) -> None:
         pass
 
-    def state_backend_cfg(self, cfg: StateBackendConfiguration) -> None:
+    def state_backend_cfg(
+        self,
+        *,
+        cfg: StateBackendConfiguration,
+        data: JsonType,
+    ) -> None:
         pass
 
     def build(

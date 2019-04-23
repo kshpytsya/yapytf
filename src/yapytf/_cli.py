@@ -81,7 +81,12 @@ class ConfigurationBase:
     def schema(self, schema: Dict[str, Any]) -> None:
         pass
 
-    def state_backend_cfg(self, cfg: cfginterface.StateBackendConfiguration) -> None:
+    def state_backend_cfg(
+        self,
+        *,
+        cfg: cfginterface.StateBackendConfiguration,
+        data: cfginterface.JsonType,
+    ) -> None:
         pass
 
     def on_success(
@@ -155,7 +160,7 @@ class Model:
         self.versions = dict(providers=dict())
         self.model_obj.versions(self.versions)
         self._state_backend_cfg = cfginterface.StateBackendConfiguration()
-        self.model_obj.state_backend_cfg(self._state_backend_cfg)
+        self.model_obj.state_backend_cfg(cfg=self._state_backend_cfg, data=model_params)
 
         self._terraform_path = None
         self._providers_paths = None
