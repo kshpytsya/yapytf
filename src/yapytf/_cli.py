@@ -107,6 +107,7 @@ class ConfigurationBase:
 
 class Model:
     versions: Dict[str, Any]
+    _yapytffile_path: pathlib.Path
     _terraform_path: Optional[pathlib.Path]
     _providers_paths: Optional[Mapping[str, pathlib.Path]]
     _providers_schemas: Optional[Mapping[str, Dict[str, Any]]]
@@ -123,6 +124,7 @@ class Model:
         model_class: str,
         work_dir: pathlib.Path,
     ):
+        self._yapytffile_path = path
         self._work_dir = work_dir
 
         with AddSysPath(str(path.parent)):
@@ -174,6 +176,10 @@ class Model:
     @property
     def terraform_version(self) -> str:
         return self.versions["terraform"]
+
+    @property
+    def yapytffile_path(self) -> pathlib.Path:
+        return self._yapytffile_path
 
     @property
     def terraform_path(self) -> pathlib.Path:
@@ -466,19 +472,15 @@ def get(ctx: click.Context, **opts: Any) -> None:
 
 @main.command()
 @click.pass_context
-@click.argument(
-    "dir",
-    type=PathType(dir_okay=True, exists=True),
-)
 def gen(ctx: click.Context, **opts: Any) -> None:
     """
-    (Re-)generate "yapytfgen" module in specified directory.
+    (Re-)generate "yapytfgen" module in directory containing Yapytffile.py.
     Warning, existing "yapytfgen" directory will be completely wiped out.
     As a safeguard, a ".yapytfgen" marker file must exist in that directory.
     """
     co: Context = ctx.find_object(Context)
 
-    dest_dir: pathlib.Path = opts["dir"]
+    dest_dir: pathlib.Path = co.model.yapytffile_path.parent
     module_dir: pathlib.Path = dest_dir.joinpath("yapytfgen")
     marker_file: pathlib.Path = module_dir.joinpath(".yapytfgen")
     if module_dir.exists():
