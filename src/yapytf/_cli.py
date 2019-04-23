@@ -18,7 +18,8 @@ import yaml
 from implements import implements
 
 from . import (_generator, _hashigetter, _tfrun, _tfschema, _tfstate,
-               cfginterface, _genbase)
+               cfginterface)
+from . import _genbase  # noqa: F401
 
 logger = logging.getLogger(__name__)
 click_log.basic_config(logger)
@@ -68,6 +69,14 @@ class AddModuleAlias:
             pass
 
 
+def wipe_dir(d: pathlib.Path) -> None:
+    for i in d.iterdir():
+        if i.is_dir():
+            shutil.rmtree(i)
+        else:
+            i.unlink()
+
+
 class ConfigurationBase:
     def schema(self, schema: Dict[str, Any]) -> None:
         pass
@@ -79,6 +88,14 @@ class ConfigurationBase:
         self,
         *,
         state: "yapytfgen.state"  # type: ignore  # noqa
+    ) -> None:
+        pass
+
+    def mementos(
+        self,
+        *,
+        state: "yapytfgen.state",  # type: ignore  # noqa
+        dest: pathlib.Path,
     ) -> None:
         pass
 
@@ -487,6 +504,12 @@ def lint(ctx: click.Context, **opts: Any) -> None:
 
 
 @main.command()
+@click.option(
+    "--mementos",
+    type=PathType(dir_okay=True),
+    help="directory into which to store model mementos. Warning: will completely wipe the directory! "
+    "Note that mementos will only be stored in case of a successful execution"
+)
 @click.pass_context
 def apply(ctx: click.Context, **opts: Any) -> None:
     """
@@ -501,7 +524,26 @@ def apply(ctx: click.Context, **opts: Any) -> None:
         # print(yaml.dump(st, default_flow_style=False))
 
         yapytfgen_state_class = getattr(co.model.yapytfgen_module, "state")
-        co.model.model_obj.on_success(state=yapytfgen_state_class(st))
+        state = yapytfgen_state_class(st)
+        co.model.model_obj.on_success(state=state)
+
+        mementos_dir: Optional[pathlib.Path] = opts["mementos"]
+        if mementos_dir is not None:
+            marker_file: pathlib.Path = mementos_dir.joinpath(".yapytf_mementos")
+
+            if mementos_dir.exists():
+                if not marker_file.exists():
+                    raise click.ClickException(
+                        f"Cowardly refusing to wipe existing \"{mementos_dir}\", "
+                        + "which does not contain \".yapytf_mementos\" marker file"
+                    )
+                wipe_dir(mementos_dir)
+            else:
+                mementos_dir.mkdir()
+
+            marker_file.touch()
+
+            co.model.model_obj.mementos(state=state, dest=mementos_dir)
 
 
 @main.command()

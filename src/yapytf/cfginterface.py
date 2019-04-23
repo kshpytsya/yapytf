@@ -1,3 +1,4 @@
+import pathlib
 from typing import Any, Dict
 from implements import Interface
 
@@ -39,5 +40,13 @@ class IConfiguration(Interface):
         self,
         *,
         state: "yapytfgen.state",  # type: ignore  # noqa
+    ) -> None:
+        pass
+
+    def mementos(
+        self,
+        *,
+        state: "yapytfgen.state",  # type: ignore  # noqa
+        dest: pathlib.Path,
     ) -> None:
         pass
