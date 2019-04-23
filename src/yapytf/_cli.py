@@ -1,5 +1,6 @@
-import inspect
 import importlib
+import importlib.machinery
+import inspect
 import json
 import logging
 import pathlib
@@ -7,15 +8,17 @@ import runpy
 import shutil
 import sys
 import tempfile
-from typing import Any, Callable, Dict, Generator, Mapping, Optional
+from typing import Any, Callable, Dict, Generator, List, Mapping, Optional
 
 import click
 import click_log
 import jsonschema
 import yaml
+
 from implements import implements
 
-from . import _generator, _hashigetter, _tfrun, _tfschema, cfginterface
+from . import (_generator, _hashigetter, _tfrun, _tfschema, _tfstate,
+               cfginterface, _genbase)
 
 logger = logging.getLogger(__name__)
 click_log.basic_config(logger)
@@ -36,11 +39,47 @@ class AddSysPath:
             pass
 
 
+class AddModuleAlias:
+    def __init__(self, alias: str, target_module: str) -> None:
+        class Finder(importlib.abc.MetaPathFinder):
+            @classmethod
+            def find_spec(cls, fullname, path=None, target=None):  # type: ignore
+                if fullname == alias:
+                    class Loader(importlib.abc.Loader):
+                        def create_module(self, spec):  # type: ignore
+                            return sys.modules[target_module]
+
+                        def exec_module(self, module):  # type: ignore
+                            pass
+
+                    return importlib.machinery.ModuleSpec(fullname, Loader())
+                else:
+                    return None
+
+        self._finder = Finder()
+
+    def __enter__(self) -> None:
+        sys.meta_path.insert(0, self._finder)
+
+    def __exit__(self, *args: Any) -> None:
+        try:
+            sys.meta_path.remove(self._finder)
+        except ValueError:
+            pass
+
+
 class ConfigurationBase:
     def schema(self, schema: Dict[str, Any]) -> None:
         pass
 
     def state_backend_cfg(self, cfg: cfginterface.StateBackendConfiguration) -> None:
+        pass
+
+    def on_success(
+        self,
+        *,
+        state: "yapytfgen.state"  # type: ignore  # noqa
+    ) -> None:
         pass
 
 
@@ -170,6 +209,7 @@ class Model:
         self,
         *,
         module_dir: pathlib.Path,
+        make_genbase_link: bool,
     ) -> None:
         logger.debug("terraform_path: %s", self.terraform_path)
         logger.debug("providers_paths: %s", self.providers_paths)
@@ -185,7 +225,11 @@ class Model:
                 provider_schema=self.providers_schemas[provider_name]
             )
 
-        _generator.gen_yapytfgen(module_dir=module_dir, providers_paths=providers_py_paths)
+        _generator.gen_yapytfgen(
+            module_dir=module_dir,
+            providers_paths=providers_py_paths,
+            make_genbase_link=make_genbase_link
+        )
 
     def produce_tf_files(
         self,
@@ -203,101 +247,105 @@ class Model:
         root_data = {
             "terraform": {
                 "backend": {
-                    self.state_backend_cfg.name: self.state_backend_cfg.cfg_vars
-                }
-            },
-            "module": {
-                "body": {
-                    "source": "./body"
+                    self.state_backend_cfg.name: self.state_backend_cfg.vars
                 }
             }
         }
 
-        write(dest, root_data)
-
-        body_data: Dict[str, Any] = {}
-
         if build_cb:
-            build_cb(body_data)
+            build_cb(root_data)
 
-        body_path: pathlib.Path = dest.joinpath("body")
-        body_path.mkdir()
-        write(body_path, body_data)
-
-    def prepare_step(
-        self,
-        *,
-        step_dir: pathlib.Path,
-        step_data: Any,
-    ) -> None:
-        pass
+        write(dest, root_data)
 
     def prepare_steps(
         self,
-    ) -> None:
-        module_dir = self._work_dir.joinpath("yapytfgen")
-        module_dir.mkdir()
+        destroy: bool = False
+    ) -> List[pathlib.Path]:
+        if destroy:
+            steps = [("destroy", None)]
+        else:
+            module_dir = self._work_dir.joinpath("yapytfgen")
+            module_dir.mkdir()
 
-        self.gen_yapytfgen(
-            module_dir=module_dir,
-        )
-
-        with AddSysPath(str(self._work_dir)):
-            yapytfgen_module = importlib.import_module("yapytfgen")
-
-        yapytfgen_model_class = getattr(yapytfgen_module, "model")
-
-        def build(data: Dict[str, Any]) -> None:
-            d: Dict[str, Any] = {
-                "provider": {
-                    provider_name: {'': {}}
-                    for provider_name in self.providers_versions
-                }
-            }
-
-            yapytfgen_model = yapytfgen_model_class(d)
-            self.model_obj.build(
-                model=yapytfgen_model,
-                data=self._model_params,
-                step_data=None
+            self.gen_yapytfgen(
+                module_dir=module_dir,
+                make_genbase_link=False,
             )
 
-            assert "provider" not in d["tf"]
-            data["provider"] = [
-                {
-                    provider_type:
-                    {
-                        **provider_data,
-                        **({"alias": provider_alias} if provider_alias else {})
+            with AddSysPath(str(self._work_dir)), AddModuleAlias("yapytfgen._genbase", "yapytf._genbase"):
+                self.yapytfgen_module = importlib.import_module("yapytfgen")
+
+            yapytfgen_model_class = getattr(self.yapytfgen_module, "model")
+
+            steps = [("create1", None)]
+
+        result: List[pathlib.Path] = []
+        for step_name, step_data in steps:
+            def build(data: Dict[str, Any]) -> None:
+                if destroy:
+                    return
+
+                d: Dict[str, Any] = {
+                    "provider": {
+                        provider_name: {'': {}}
+                        for provider_name in self.providers_versions
                     }
                 }
-                for provider_type, provider_aliases in d["provider"].items()
-                for provider_alias, provider_data in provider_aliases.items()
-            ]
 
-            def drop_empty(d: Dict[Any, Any]) -> Generator[Any, None, None]:
-                return ((k, v) for k, v in d.items() if v)
+                yapytfgen_model = yapytfgen_model_class(d)
+                self.model_obj.build(
+                    model=yapytfgen_model,
+                    data=self._model_params,
+                    step_data=step_data
+                )
 
-            data.update(drop_empty({k: dict(drop_empty(v)) for k, v in d["tf"].items()}))
+                assert "provider" not in d["tf"]
+                data["provider"] = [
+                    {
+                        provider_type:
+                        {
+                            **provider_data,
+                            **({"alias": provider_alias} if provider_alias else {})
+                        }
+                    }
+                    for provider_type, provider_aliases in d["provider"].items()
+                    for provider_alias, provider_data in provider_aliases.items()
+                ]
 
-            # expand "provider" properties
-            for kind in ["data", "resource"]:
-                resource_type_to_provider = self.resource_type_to_provider[kind]
-                for resource_type, resources in data.get(kind, {}).items():
-                    for resource_name, resource_data in resources.items():
-                        provider_alias = resource_data.get("provider")
-                        if provider_alias is not None:
-                            provider_type = resource_type_to_provider[resource_type]
-                            assert provider_alias in d["provider"][provider_type]
-                            resource_data["provider"] = f"{provider_type}.{provider_alias}"
+                def drop_empty(d: Dict[Any, Any]) -> Generator[Any, None, None]:
+                    return ((k, v) for k, v in d.items() if v)
 
-        self.produce_tf_files(dest=self._work_dir, build_cb=build)
+                data.update(drop_empty({k: dict(drop_empty(v)) for k, v in d["tf"].items()}))
 
-        _tfrun.tf_init(
-            work_dir=self._work_dir,
-            terraform_path=self.terraform_path,
-            providers_paths=self.providers_paths.values()
-        )
+                # expand "provider" properties
+                for kind in ["data", "resource"]:
+                    resource_type_to_provider = self.resource_type_to_provider[kind]
+                    for resource_type, resources in data.get(kind, {}).items():
+                        for resource_name, resource_data in resources.items():
+                            provider_alias = resource_data.get("provider")
+                            if provider_alias is not None:
+                                provider_type = resource_type_to_provider[resource_type]
+                                assert provider_alias in d["provider"][provider_type]
+                                resource_data["provider"] = f"{provider_type}.{provider_alias}"
+
+            step_dir = self._work_dir.joinpath(f"step.{step_name}")
+            step_dir.mkdir()
+            result.append(step_dir)
+
+            self.produce_tf_files(dest=step_dir, build_cb=build)
+
+            _tfrun.tf_init(
+                work_dir=step_dir,
+                terraform_path=self.terraform_path,
+                providers_paths=self.providers_paths.values()
+            )
+
+            _tfrun.tf_validate(
+                work_dir=step_dir,
+                terraform_path=self.terraform_path,
+            )
+
+        return result
 
 
 class Context:
@@ -306,7 +354,7 @@ class Context:
 
 
 class PathType(click.Path):
-    def coerce_path_result(self, rv):
+    def coerce_path_result(self, rv) -> pathlib.Path:
         return pathlib.Path(super().coerce_path_result(rv))
 
 
@@ -340,7 +388,7 @@ class PathType(click.Path):
 )
 @click.option("--keep-work", is_flag=True, help="keep working directory")
 @click.pass_context
-def main(ctx: click.Context, **opts):
+def main(ctx: click.Context, **opts: Any) -> None:
     """
     Yet Another Python Terraform Wrapper
     """
@@ -386,7 +434,7 @@ def main(ctx: click.Context, **opts):
 @click.argument("product")
 @click.argument("ver")
 @click.pass_context
-def get(ctx: click.Context, **opts):
+def get(ctx: click.Context, **opts: Any) -> None:
     """
     Download hashicorp product
     """
@@ -400,7 +448,7 @@ def get(ctx: click.Context, **opts):
     "dir",
     type=PathType(dir_okay=True, exists=True),
 )
-def gen(ctx: click.Context, **opts):
+def gen(ctx: click.Context, **opts: Any) -> None:
     """
     (Re-)generate "yapytfgen" module in specified directory.
     Warning, existing "yapytfgen" directory will be completely wiped out.
@@ -424,12 +472,12 @@ def gen(ctx: click.Context, **opts):
     marker_file.touch()
     module_dir.joinpath(".gitignore").write_text("*\n")
 
-    co.model.gen_yapytfgen(module_dir=module_dir)
+    co.model.gen_yapytfgen(module_dir=module_dir, make_genbase_link=True)
 
 
 @main.command()
 @click.pass_context
-def lint(ctx: click.Context, **opts):
+def lint(ctx: click.Context, **opts: Any) -> None:
     """
     Validate model file
     """
@@ -440,11 +488,41 @@ def lint(ctx: click.Context, **opts):
 
 @main.command()
 @click.pass_context
+def apply(ctx: click.Context, **opts: Any) -> None:
+    """
+    Build or change infrastructure
+    """
+    co: Context = ctx.find_object(Context)
+
+    steps = co.model.prepare_steps()
+    if _tfrun.tf_apply(work_dir=steps[0], terraform_path=co.model.terraform_path):
+        st = _tfrun.tf_get_state(work_dir=steps[0], terraform_path=co.model.terraform_path)
+        st = _tfstate.get_resources_attrs(st)
+        # print(yaml.dump(st, default_flow_style=False))
+
+        yapytfgen_state_class = getattr(co.model.yapytfgen_module, "state")
+        co.model.model_obj.on_success(state=yapytfgen_state_class(st))
+
+
+@main.command()
+@click.pass_context
+def destroy(ctx: click.Context, **opts: Any) -> None:
+    """
+    Destroy Terraform-managed infrastructure
+    """
+    co: Context = ctx.find_object(Context)
+
+    steps = co.model.prepare_steps(destroy=True)
+    _tfrun.tf_destroy(work_dir=steps[0], terraform_path=co.model.terraform_path)
+
+
+@main.command()
+@click.pass_context
 @click.argument(
     "args",
     nargs=-1
 )
-def rawtf(ctx: click.Context, **opts):
+def rawtf(ctx: click.Context, **opts: Any) -> None:
     """
     Execute raw terraform commands
     """

@@ -11,6 +11,10 @@ KIND_TO_KEY = {
     "data_source": "data",
     "resource": "resource",
 }
+STATE_KIND_TO_KEY = {
+    "data_source": "data",
+    "resource": "managed",
+}
 
 # https://www.terraform.io/docs/configuration/resources.html#meta-arguments
 # TODO: this is incomplete
@@ -155,15 +159,19 @@ def make_bag_of_class(
     instance_class_name: str,
     class_path: List[str],
     data_path: List[str],
-    extra_properties: Mapping[str, str] = {}
+    extra_properties: Mapping[str, Any] = {},
+    reader: bool,
+    key_type: str = "str",
 ) -> None:
     full_instance_class_name = ".".join(class_path + [instance_class_name])
+
+    mapping_type = "Mapping" if reader else "MutableMapping"
 
     class_builder = def_block(
         builder,
         1 if class_path else 2,
         f"class {bag_class_name}",
-        [f"MutableMapping[str, \"{full_instance_class_name}\"]"]
+        [f"{mapping_type}[{key_type}, \"{full_instance_class_name}\"]"]
     )
     class_builder.line("__slots__ = \"_data\"")
 
@@ -174,28 +182,34 @@ def make_bag_of_class(
         ["self", f"data: {DATA_TYPE_HINT}"],
         "None",
         lines=[
-            f"self._data: {DATA_TYPE_HINT} = data" + "".join(f".setdefault(\"{i}\", {{}})" for i in data_path),
+            f"self._data: {DATA_TYPE_HINT} = _genbase.dict_path_{'ro' if reader else 'rw'}(data, {data_path!r})"
         ]
     )
-    def_block(
-        class_builder,
-        1,
-        "def __delitem__",
-        ["self", "key: str"],
-        "None",
-        lines=[
-            "self._data.__delitem__(key)",
-        ]
-    )
+
+    if not reader:
+        def_block(
+            class_builder,
+            1,
+            "def __delitem__",
+            ["self", f"key: {key_type}"],
+            "None",
+            lines=[
+                "self._data.__delitem__(key)",
+            ]
+        )
+
     def_block(
         class_builder,
         1,
         "def __getitem__",
-        ["self", "key: str"],
+        ["self", f"key: {key_type}"],
         f"\"{full_instance_class_name}\"",
         lines=[
             # TODO validate key
-            f"return {full_instance_class_name}(self._data.setdefault(key, {{}}))",
+            "return {}(self._data{})".format(
+                full_instance_class_name,
+                "[key]" if reader else ".setdefault(key, {})"
+            ),
         ]
     )
     def_block(
@@ -203,23 +217,25 @@ def make_bag_of_class(
         1,
         "def __iter__",
         ["self"],
-        "Iterator[str]",
+        f"Iterator[{key_type}]",
         lines=["return self._data.__iter__()"]
     )
     def_block(class_builder, 1, "def __len__", ["self"], "int", lines=["return len(self._data)"])
-    def_block(
-        class_builder,
-        1,
-        "def __setitem__",
-        ["self", "key: str", f"value: \"{full_instance_class_name}\""],
-        "None",
-        lines=[
-            # TODO validate key
-            f"if not isinstance(value, {full_instance_class_name}):",
-            f"\traise TypeError(\"expect {full_instance_class_name}, got {{type(value).__name__}}\")",
-            "self._data[key] = copy.deepcopy(value._data)",
-        ]
-    )
+
+    if not reader:
+        def_block(
+            class_builder,
+            1,
+            "def __setitem__",
+            ["self", f"key: {key_type}", f"value: \"{full_instance_class_name}\""],
+            "None",
+            lines=[
+                # TODO validate key
+                f"if not isinstance(value, {full_instance_class_name}):",
+                f"\traise TypeError(\"expect {full_instance_class_name}, got {{type(value).__name__}}\")",
+                "self._data[key] = copy.deepcopy(value._data)",
+            ]
+        )
 
     for prop_name, prop_key in extra_properties.items():
         assert prop_name.isidentifier()
@@ -524,7 +540,8 @@ def make_schema_class(
     builder: Builder,
     class_name: str,
     schemas: Iterable[Mapping[str, Any]],
-    class_path: List[str]
+    class_path: List[str],
+    reader: bool,
 ) -> str:
     full_class_name = ".".join(class_path + [class_name])
     class_builder = def_block(
@@ -573,7 +590,8 @@ def make_schema_class(
 
     for schema in schemas:
         for attr_name, attr_schema in schema.get("block", {}).get("attributes", {}).items():
-            if attr_schema.get("computed", False):
+            attr_computed = attr_schema.get("computed", False)
+            if not reader and attr_computed:
                 continue
 
             assert attr_name.isidentifier()
@@ -604,36 +622,37 @@ def make_schema_class(
                 lines=[
                     f"result = self._data.get(\"{attr_name}\")",
                     "if result is None:",
-                    f"\treturn self._validate_{attr_name}(result)",
+                    "\treturn None",
                     "else:",
-                    f"\treturn None"
+                    f"\treturn self._validate_{attr_name}(result)",
                 ]
             )
 
-            def_block(
-                class_builder,
-                1,
-                f"def {attr_name}{attr_slug}",
-                ["self", f"value: {python_type}"],
-                "None",
-                decorators=[f"{attr_name}{attr_slug}.setter"],
-                lines=[
-                    f"self._validate_{attr_name}(value)",
-                    f"self._data[\"{attr_name}\"] = value",
-                ]
-            )
+            if not reader:
+                def_block(
+                    class_builder,
+                    1,
+                    f"def {attr_name}{attr_slug}",
+                    ["self", f"value: {python_type}"],
+                    "None",
+                    decorators=[f"{attr_name}{attr_slug}.setter"],
+                    lines=[
+                        f"self._validate_{attr_name}(value)",
+                        f"self._data[\"{attr_name}\"] = value",
+                    ]
+                )
 
-            def_block(
-                class_builder,
-                1,
-                f"def {attr_name}{attr_slug}",
-                ["self"],
-                "None",
-                decorators=[f"{attr_name}{attr_slug}.deleter"],
-                lines=[
-                    f"self._data.pop(\"{attr_name}\", None)",
-                ]
-            )
+                def_block(
+                    class_builder,
+                    1,
+                    f"def {attr_name}{attr_slug}",
+                    ["self"],
+                    "None",
+                    decorators=[f"{attr_name}{attr_slug}.deleter"],
+                    lines=[
+                        f"self._data.pop(\"{attr_name}\", None)",
+                    ]
+                )
 
         for attr_name, attr_schema in schema.get("block", {}).get("block_types", {}).items():
             assert attr_name.isidentifier()
@@ -643,7 +662,8 @@ def make_schema_class(
                 builder=class_builder,
                 class_name=f"_instance_{attr_name}",
                 schemas=[attr_schema],
-                class_path=class_path + [class_name]
+                class_path=class_path + [class_name],
+                reader=reader
             )
 
             attr_nesting_mode = attr_schema["nesting_mode"]
@@ -660,31 +680,32 @@ def make_schema_class(
                     ]
                 )
 
-                def_block(
-                    class_builder,
-                    1,
-                    f"def {attr_name}{attr_slug}",
-                    ["self", f"value: \"{attr_class_name}\""],
-                    "None",
-                    decorators=[f"{attr_name}{attr_slug}.setter"],
-                    lines=[
-                        f"if not isinstance(value, {attr_class_name}):",
-                        f"\traise TypeError(\"expect {attr_class_name}, got {{type(value).__name__}}\")",
-                        f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
-                    ]
-                )
+                if not reader:
+                    def_block(
+                        class_builder,
+                        1,
+                        f"def {attr_name}{attr_slug}",
+                        ["self", f"value: \"{attr_class_name}\""],
+                        "None",
+                        decorators=[f"{attr_name}{attr_slug}.setter"],
+                        lines=[
+                            f"if not isinstance(value, {attr_class_name}):",
+                            f"\traise TypeError(\"expect {attr_class_name}, got {{type(value).__name__}}\")",
+                            f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
+                        ]
+                    )
 
-                def_block(
-                    class_builder,
-                    1,
-                    f"def {attr_name}{attr_slug}",
-                    ["self"],
-                    "None",
-                    decorators=[f"{attr_name}{attr_slug}.deleter"],
-                    lines=[
-                        f"self._data.pop(\"{attr_name}\", None)",
-                    ]
-                )
+                    def_block(
+                        class_builder,
+                        1,
+                        f"def {attr_name}{attr_slug}",
+                        ["self"],
+                        "None",
+                        decorators=[f"{attr_name}{attr_slug}.deleter"],
+                        lines=[
+                            f"self._data.pop(\"{attr_name}\", None)",
+                        ]
+                    )
             elif attr_nesting_mode in {"list", "set"}:
                 attr_list_class_name = make_list_of_class(
                     builder=class_builder,
@@ -707,31 +728,32 @@ def make_schema_class(
                     ]
                 )
 
-                def_block(
-                    class_builder,
-                    1,
-                    f"def {attr_name}{attr_slug}",
-                    ["self", f"value: \"{attr_class_name}\""],
-                    "None",
-                    decorators=[f"{attr_name}{attr_slug}.setter"],
-                    lines=[
-                        f"if not isinstance(value, {attr_list_class_name}):",
-                        f"\traise TypeError(\"expect {attr_list_class_name}, got {{type(value).__name__}}\")",
-                        f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
-                    ]
-                )
+                if not reader:
+                    def_block(
+                        class_builder,
+                        1,
+                        f"def {attr_name}{attr_slug}",
+                        ["self", f"value: \"{attr_class_name}\""],
+                        "None",
+                        decorators=[f"{attr_name}{attr_slug}.setter"],
+                        lines=[
+                            f"if not isinstance(value, {attr_list_class_name}):",
+                            f"\traise TypeError(\"expect {attr_list_class_name}, got {{type(value).__name__}}\")",
+                            f"self._data[\"{attr_name}\"] = copy.deepcopy(value._data)",
+                        ]
+                    )
 
-                def_block(
-                    class_builder,
-                    1,
-                    f"def {attr_name}{attr_slug}",
-                    ["self"],
-                    "None",
-                    decorators=[f"{attr_name}{attr_slug}.deleter"],
-                    lines=[
-                        f"self._data.pop(\"{attr_name}\", None)",
-                    ]
-                )
+                    def_block(
+                        class_builder,
+                        1,
+                        f"def {attr_name}{attr_slug}",
+                        ["self"],
+                        "None",
+                        decorators=[f"{attr_name}{attr_slug}.deleter"],
+                        lines=[
+                            f"self._data.pop(\"{attr_name}\", None)",
+                        ]
+                    )
             else:
                 assert 0, f"Unknown Terraform nesting_mode {attr_nesting_mode}"
 
@@ -770,31 +792,34 @@ def gen_provider_py(
         imports_block.lines([
             "import copy",
             "from typing import cast, Any, Dict, Iterable, Iterator, "
-            + "List, MutableMapping, MutableSequence, Optional, overload, Union"
+            + "List, MutableMapping, MutableSequence, Optional, overload, Union",
+            "from .. import _genbase",
         ])
 
         def make_v1() -> None:
             make_schema_class(
                 builder=builder,
-                class_name="v1_provider",
+                class_name="v1_model_provider",
                 schemas=[pschema["provider"]],
-                class_path=[]
+                class_path=[],
+                reader=False,
             )
             make_bag_of_class(
                 builder=builder,
-                bag_class_name="v1_providers",
-                instance_class_name="v1_provider",
+                bag_class_name="v1_model_providers",
+                instance_class_name="v1_model_provider",
                 class_path=[],
                 data_path=["provider", provider_name],
-                extra_properties=dict(default="")
+                extra_properties=dict(default=""),
+                reader=False,
             )
 
             for kind in ["data_source", "resource"]:
-                ns_props: Dict[str, str] = {}
+                ns_props: Dict[str, Dict[str, str]] = {}
 
                 for rname, rschema in pschema.get(f"{kind}_schemas", {}).items():
                     if rname == provider_name:
-                        stripped_name = "_"
+                        stripped_name = "X"
                     else:
                         assert rname.startswith(provider_name_)
                         stripped_name = rname[len(provider_name_):]
@@ -805,36 +830,69 @@ def gen_provider_py(
 
                     module_builder.lines([
                         "import copy",
-                        "from typing import cast, overload, Iterable, Iterator, Optional, MutableMapping, "
-                        + "MutableSequence, List, Dict, Any, Union"
+                        "from typing import cast, overload, Iterable, Iterator, Optional, Mapping, MutableMapping, "
+                        + "MutableSequence, List, Dict, Any, Union",
+                        "from .. import _genbase",
                     ])
                     module_builder.blanks(1)
 
-                    ns_props[stripped_name] = f"{module_name}.Bag"
+                    for what in ["model", "state"]:
+                        ns_props.setdefault(what, {})[stripped_name] = f"{module_name}.{what}_bag"
 
                     make_bag_of_class(
                         builder=module_builder,
-                        bag_class_name="Bag",
-                        instance_class_name="Instance",
+                        bag_class_name="model_bag",
+                        instance_class_name="model_instance",
                         class_path=[],
                         data_path=["tf", KIND_TO_KEY[kind], rname],
+                        reader=False,
                     )
 
                     make_schema_class(
                         builder=module_builder,
-                        class_name="Instance",
+                        class_name="model_instance",
                         schemas=[_RES_META_ARGS_SCHEMA, rschema],
-                        class_path=[]
+                        class_path=[],
+                        reader=False,
+                    )
+
+                    make_bag_of_class(
+                        builder=module_builder,
+                        bag_class_name="state_bag",
+                        instance_class_name="state_inner_bag",
+                        class_path=[],
+                        data_path=[STATE_KIND_TO_KEY[kind], rname],
+                        reader=True,
+                    )
+
+                    make_bag_of_class(
+                        builder=module_builder,
+                        bag_class_name="state_inner_bag",
+                        instance_class_name="state_instance",
+                        class_path=[],
+                        data_path=[],
+                        key_type="Any",
+                        reader=True,
+                        extra_properties=dict(x=None),
+                    )
+
+                    make_schema_class(
+                        builder=module_builder,
+                        class_name="state_instance",
+                        schemas=[rschema],
+                        class_path=[],
+                        reader=True,
                     )
 
                     finalize_builder(module_name, module_builder)
 
-                make_ns_class(
-                    builder=builder,
-                    class_name=f"v1_{kind}s",
-                    data_type=DATA_TYPE_HINT,
-                    props=ns_props,
-                )
+                for what in ["model", "state"]:
+                    make_ns_class(
+                        builder=builder,
+                        class_name=f"v1_{what}_{kind}s",
+                        data_type=DATA_TYPE_HINT,
+                        props=ns_props.get(what, {}),
+                    )
 
         make_v1()
 
@@ -849,6 +907,7 @@ def gen_yapytfgen(
     *,
     module_dir: pathlib.Path,
     providers_paths: Mapping[str, pathlib.Path],
+    make_genbase_link: bool,
 ) -> None:
     module_fname = module_dir.joinpath("__init__.py")
     builder = Builder()
@@ -858,6 +917,7 @@ def gen_yapytfgen(
         f"from . import {provider_name} as _{provider_name}"
         for provider_name in providers_paths
     ])
+    builder.line("from . import _genbase")
     builder.blanks(1)
 
     def ns(class_name: str, props: Mapping[str, str]) -> None:
@@ -881,6 +941,7 @@ def gen_yapytfgen(
     ns(
         "model_tf_v1",
         {
+            "l": "_genbase.Locals",
             "d": "model_tf_v1_data_sources",
             "p": "model_tf_v1_providers",
             "r": "model_tf_v1_resources",
@@ -891,7 +952,29 @@ def gen_yapytfgen(
         ns(
             f"model_tf_v1_{kind}s",
             {
-                provider_name: f"_{provider_name}.v1_{kind}s"
+                provider_name: f"_{provider_name}.v1_model_{kind}s"
+                for provider_name in providers_paths
+            }
+        )
+
+    ns(
+        "state",
+        {"v1": "state_v1"}
+    )
+
+    ns(
+        "state_v1",
+        {
+            "d": "state_v1_data_sources",
+            "r": "state_v1_resources",
+        }
+    )
+
+    for kind in ["data_source", "resource"]:
+        ns(
+            f"state_v1_{kind}s",
+            {
+                provider_name: f"_{provider_name}.v1_state_{kind}s"
                 for provider_name in providers_paths
             }
         )
@@ -902,3 +985,7 @@ def gen_yapytfgen(
 
     for provider_name, provider_path in providers_paths.items():
         module_dir.joinpath(provider_name).symlink_to(provider_path, target_is_directory=True)
+
+    if make_genbase_link:
+        this_dir = pathlib.Path(__file__).parent
+        module_dir.joinpath("_genbase").symlink_to(this_dir.joinpath("_genbase"), target_is_directory=True)

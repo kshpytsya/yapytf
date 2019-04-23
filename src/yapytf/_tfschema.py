@@ -1,10 +1,7 @@
 import json
 import pathlib
 import shutil
-import subprocess
-import sys
-
-import click
+from typing import Any, Dict
 
 from . import _pcache, _tfrun
 
@@ -17,7 +14,7 @@ def get(
     provider_name: str,
     provider_path: pathlib.Path,
     provider_version: str,
-) -> dict:
+) -> Dict[str, Any]:
     key = "tfschema-{}-{}-{}".format(terraform_version, provider_name, provider_version)
 
     FNAME = "schema.json"
@@ -35,24 +32,12 @@ def get(
             providers_paths=[provider_path]
         )
 
-        cp = subprocess.run(
-            [
-                terraform_path.joinpath("terraform"),
-                "providers",
-                "schema",
-                "-json"
-            ],
-            cwd=this_work_dir,
-            capture_output=True,
+        output = _tfrun.tf_run_non_interactive(
+            work_dir=this_work_dir,
+            terraform_path=terraform_path,
+            args=["providers", "schema", "-json"]
         )
-
-        if cp.returncode:
-            sys.stderr.buffer.write(cp.stderr)
-            raise click.ClickException(
-                '"terraform providers schema -json" failed with return code {}'.format(cp.returncode)
-            )
-
-        dir_path.joinpath(FNAME).write_bytes(cp.stdout)
+        dir_path.joinpath(FNAME).write_bytes(output)
 
     cache_dir = _pcache.get(key, produce)
 

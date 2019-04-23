@@ -10,7 +10,6 @@ setup(
     author_email="kshpitsa@gmail.com",
     url="https://github.com/kshpytsya/yapytf",
     install_requires=[
-        "attrs>=19.1.0,<20",
         "click>=7.0,<8",
         "click-log>=0.3.2,<1",
         "implements>=0.1.4,<1",
@@ -26,6 +25,7 @@ setup(
     python_requires=">=3.6, <3.8",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
+    zip_safe=False,
     entry_points={
         "console_scripts": ["yapytf = yapytf._cli:main"]
     },

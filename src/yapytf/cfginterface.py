@@ -1,13 +1,13 @@
 from typing import Any, Dict
 from implements import Interface
 
-import attr
 
-
-@attr.s
 class StateBackendConfiguration:
-    name: str = "local"
-    cfg_vars: Dict[str, str] = {}
+    __slots__ = ('name', 'vars')
+
+    def __init__(self) -> None:
+        self.name: str = "local"
+        self.vars: Dict[str, str] = {}
 
 
 JsonType = Dict[str, Any]
@@ -32,5 +32,12 @@ class IConfiguration(Interface):
         model: "yapytfgen.model",  # type: ignore  # noqa
         data: JsonType,
         step_data: Any,
+    ) -> None:
+        pass
+
+    def on_success(
+        self,
+        *,
+        state: "yapytfgen.state",  # type: ignore  # noqa
     ) -> None:
         pass
