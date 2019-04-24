@@ -8,7 +8,7 @@ import runpy
 import shutil
 import sys
 import tempfile
-from typing import Any, Callable, Dict, Generator, List, Mapping, Optional
+from typing import Any, Callable, Dict, Generator, List, Mapping, Optional, Tuple
 
 import click
 import click_log
@@ -78,6 +78,9 @@ def wipe_dir(d: pathlib.Path) -> None:
 
 
 class ConfigurationBase:
+    def __init__(self) -> None:
+        pass
+
     def schema(self, schema: Dict[str, Any]) -> None:
         pass
 
@@ -115,6 +118,7 @@ class Model:
     _model_params: Dict[str, Any]
     _work_dir: pathlib.Path
     _resource_type_to_provider: Optional[Dict[str, Dict[str, str]]]
+    _resources_schemas_versions: Optional[Dict[Tuple[str, str], int]]
 
     def __init__(
         self,
@@ -168,6 +172,7 @@ class Model:
         self._providers_paths = None
         self._providers_schemas = None
         self._resource_type_to_provider = None
+        self._resources_schemas_versions = None
 
     @property
     def state_backend_cfg(self) -> cfginterface.StateBackendConfiguration:
@@ -232,6 +237,19 @@ class Model:
             }
 
         return self._resource_type_to_provider
+
+    @property
+    def resources_schemas_versions(self) -> Dict[Tuple[str, str], int]:
+        if self._resources_schemas_versions is None:
+            self._resources_schemas_versions = {
+                (kind_key, resource_type): resource_schema["version"]
+                for kind, kind_key in _generator.STATE_KIND_TO_KEY.items()
+                for provider_name, provider_schema in self.providers_schemas.items()
+                for resource_type, resource_schema
+                in provider_schema["provider_schemas"][provider_name].get(f"{kind}_schemas", {}).items()
+            }
+
+        return self._resources_schemas_versions
 
     def gen_yapytfgen(
         self,
@@ -527,7 +545,7 @@ def apply(ctx: click.Context, **opts: Any) -> None:
     steps = co.model.prepare_steps()
     if _tfrun.tf_apply(work_dir=steps[0], terraform_path=co.model.terraform_path):
         st = _tfrun.tf_get_state(work_dir=steps[0], terraform_path=co.model.terraform_path)
-        st = _tfstate.get_resources_attrs(st)
+        st = _tfstate.get_resources_attrs(st, co.model.resources_schemas_versions)
         # print(yaml.dump(st, default_flow_style=False))
 
         yapytfgen_state_class = getattr(co.model.yapytfgen_module, "state")

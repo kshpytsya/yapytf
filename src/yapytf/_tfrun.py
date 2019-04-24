@@ -125,7 +125,10 @@ def tf_apply(
     returncode = tf_run_interactive(
         work_dir=work_dir,
         terraform_path=terraform_path,
-        args=["apply"]
+        args=[
+            "apply",
+            "-input=false"
+        ]
     )
     return returncode == 0
 

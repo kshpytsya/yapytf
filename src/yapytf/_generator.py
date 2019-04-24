@@ -590,8 +590,9 @@ def make_schema_class(
 
     for schema in schemas:
         for attr_name, attr_schema in schema.get("block", {}).get("attributes", {}).items():
+            attr_optional = attr_schema.get("optional", False)
             attr_computed = attr_schema.get("computed", False)
-            if not reader and attr_computed:
+            if not(reader or not(attr_computed) or attr_optional):
                 continue
 
             assert attr_name.isidentifier()
