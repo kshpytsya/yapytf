@@ -308,29 +308,26 @@ class Model:
         destroy: bool = False
     ) -> List[pathlib.Path]:
         if destroy:
-            steps = [("destroy", None)]
+            steps = [("destroy", ...)]
         else:
-            module_dir = self._work_dir.joinpath("yapytfgen")
-            module_dir.mkdir()
-
-            self.gen_yapytfgen(
-                module_dir=module_dir,
-                make_genbase_link=False,
-            )
-
-            with AddSysPath(str(self._work_dir)), AddModuleAlias("yapytfgen._genbase", "yapytf._genbase"):
-                self.yapytfgen_module = importlib.import_module("yapytfgen")
-
-            yapytfgen_model_class = getattr(self.yapytfgen_module, "model")
-
             steps = [("create1", None)]
+
+        module_dir = self._work_dir.joinpath("yapytfgen")
+        module_dir.mkdir()
+
+        self.gen_yapytfgen(
+            module_dir=module_dir,
+            make_genbase_link=False,
+        )
+
+        with AddSysPath(str(self._work_dir)), AddModuleAlias("yapytfgen._genbase", "yapytf._genbase"):
+            self.yapytfgen_module = importlib.import_module("yapytfgen")
+
+        yapytfgen_model_class = getattr(self.yapytfgen_module, "model")
 
         result: List[pathlib.Path] = []
         for step_name, step_data in steps:
             def build(data: Dict[str, Any]) -> None:
-                if destroy:
-                    return
-
                 d: Dict[str, Any] = {
                     "provider": {
                         provider_name: {'': {}}

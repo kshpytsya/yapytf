@@ -138,7 +138,10 @@ def tf_destroy(
     work_dir: pathlib.Path,
     terraform_path: pathlib.Path,
 ) -> None:
-    args = ["destroy"]
+    args = [
+        "destroy",
+        "-input=false"
+    ]
     returncode = tf_run_interactive(
         work_dir=work_dir,
         terraform_path=terraform_path,
