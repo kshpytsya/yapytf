@@ -609,7 +609,7 @@ def make_schema_class(
                 decorators=["staticmethod"],
                 lines=[
                     f"if not({python_type_assert_cond(attr_schema['type'])}):",
-                    f"\traise TypeError(\"expect {python_type}, got {{value!r}}\")",
+                    f"\traise TypeError(f\"expect {python_type}, got {{value!r}}\")",
                     "return value"
                 ]
             )

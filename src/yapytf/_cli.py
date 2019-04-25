@@ -332,7 +332,8 @@ class Model:
                     "provider": {
                         provider_name: {'': {}}
                         for provider_name in self.providers_versions
-                    }
+                    },
+                    "tf": {},
                 }
 
                 yapytfgen_model = yapytfgen_model_class(d)
