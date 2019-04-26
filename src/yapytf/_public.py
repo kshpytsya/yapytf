@@ -29,15 +29,16 @@ class Configurator(Interface):
     def schema_required_strings() -> Set[str]:
         return set()
 
+    @staticmethod
+    def versions(versions: Dict[str, Any]) -> None:
+        pass
+
     def __init__(self, data: JsonType) -> None:
         self._data = data
 
     @property
     def data(self) -> JsonType:
         return self._data
-
-    def versions(self, versions: Dict[str, Any]) -> None:
-        pass
 
     def state_backend_cfg(self, cfg: StateBackendConfig) -> None:
         pass

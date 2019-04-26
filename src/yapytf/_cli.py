@@ -117,6 +117,15 @@ class Model:
 
         ordered_classes = [classes[i] for i in order]
 
+        self._versions = dict(providers=dict())
+        for class_ in ordered_classes:
+            class_.versions(self.versions)
+
+        try:
+            jsonschema.validate(self.versions, VERSIONS_SCHEMA)
+        except jsonschema.exceptions.ValidationError as e:
+            raise click.ClickException(e)
+
         schema: Dict[str, Any] = {
             "$schema": "http://json-schema.org/schema#",
             "type": "object",
@@ -135,17 +144,10 @@ class Model:
 
         self._configurators: List[Configurator] = [class_(model_params) for class_ in ordered_classes]
 
-        self._versions = dict(providers=dict())
         self._state_backend_cfg = StateBackendConfig()
 
         for i in self._configurators:
-            i.versions(self.versions)
             i.state_backend_cfg(self._state_backend_cfg)
-
-        try:
-            jsonschema.validate(self.versions, VERSIONS_SCHEMA)
-        except jsonschema.exceptions.ValidationError as e:
-            raise click.ClickException(e)
 
         self._terraform_path = None
         self._providers_paths = None

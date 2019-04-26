@@ -626,7 +626,7 @@ def make_schema_class(
                 1,
                 f"def {attr_name}{attr_slug}",
                 ["self"],
-                python_type if attr_py_optional else f"Optional[{python_type}]",
+                f"Optional[{python_type}]" if attr_py_optional else python_type,
                 decorators=["property"],
                 lines=[
                     f"result = self._data.get(\"{attr_name}\")",
