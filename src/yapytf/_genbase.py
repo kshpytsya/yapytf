@@ -1,9 +1,11 @@
 import json
 from typing import Any, Dict, Iterable, Iterator, MutableMapping
 
+from . import JsonType
+
 
 def dict_path_rw(
-    d: Dict[str, Any],
+    d: JsonType,
     path: Iterable[str]
 ) -> Dict[str, Any]:
     for i in path:
@@ -13,7 +15,7 @@ def dict_path_rw(
 
 
 def dict_path_ro(
-    d: Dict[str, Any],
+    d: JsonType,
     path: Iterable[str]
 ) -> Dict[str, Any]:
     for i in path:

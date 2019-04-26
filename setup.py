@@ -17,6 +17,7 @@ setup(
         "jsonschema>=3.0.1,<4",
         "PyYAML>=5.1,<6",
         "requests>=2.21.0,<3",
+        "toposort>=1.5,<2",
         "tqdm>=4.31.1,<5",
         "xdgappdirs>=1.4.5,<2",
     ],

@@ -613,17 +613,25 @@ def make_schema_class(
                     "return value"
                 ]
             )
+
+            attr_py_optional = not(attr_computed and reader)
+
+            if attr_py_optional:
+                if_none = "return None"
+            else:
+                if_none = f"raise RuntimeError(\"state is missing computed \\\"{attr_name}\\\" attribute\")"
+
             def_block(
                 class_builder,
                 1,
                 f"def {attr_name}{attr_slug}",
                 ["self"],
-                f"Optional[{python_type}]",
+                python_type if attr_py_optional else f"Optional[{python_type}]",
                 decorators=["property"],
                 lines=[
                     f"result = self._data.get(\"{attr_name}\")",
                     "if result is None:",
-                    "\treturn None",
+                    f"\t{if_none}",
                     "else:",
                     f"\treturn self._validate_{attr_name}(result)",
                 ]
@@ -794,7 +802,7 @@ def gen_provider_py(
             "import copy",
             "from typing import cast, Any, Dict, Iterable, Iterator, "
             + "List, MutableMapping, MutableSequence, Optional, overload, Union",
-            "from .. import _genbase",
+            "from yapytf import _genbase",
         ])
 
         def make_v1() -> None:
@@ -833,7 +841,7 @@ def gen_provider_py(
                         "import copy",
                         "from typing import cast, overload, Iterable, Iterator, Optional, Mapping, MutableMapping, "
                         + "MutableSequence, List, Dict, Any, Union",
-                        "from .. import _genbase",
+                        "from yapytf import _genbase",
                     ])
                     module_builder.blanks(1)
 
@@ -908,7 +916,6 @@ def gen_yapytfgen(
     *,
     module_dir: pathlib.Path,
     providers_paths: Mapping[str, pathlib.Path],
-    make_genbase_link: bool,
 ) -> None:
     module_fname = module_dir.joinpath("__init__.py")
     builder = Builder()
@@ -918,7 +925,7 @@ def gen_yapytfgen(
         f"from . import {provider_name} as _{provider_name}"
         for provider_name in providers_paths
     ])
-    builder.line("from . import _genbase")
+    builder.line("from yapytf import _genbase")
     builder.blanks(1)
 
     def ns(class_name: str, props: Mapping[str, str]) -> None:
@@ -944,12 +951,11 @@ def gen_yapytfgen(
         {
             "l": "_genbase.Locals",
             "d": "model_tf_v1_data_sources",
-            "p": "model_tf_v1_providers",
             "r": "model_tf_v1_resources",
         }
     )
 
-    for kind in ["data_source", "provider", "resource"]:
+    for kind in ["data_source", "resource"]:
         ns(
             f"model_tf_v1_{kind}s",
             {
@@ -957,6 +963,19 @@ def gen_yapytfgen(
                 for provider_name in providers_paths
             }
         )
+
+    ns(
+        "providers_model",
+        {"v1": "model_tf_v1_providers"}
+    )
+
+    ns(
+        f"model_tf_v1_providers",
+        {
+            provider_name: f"_{provider_name}.v1_model_providers"
+            for provider_name in providers_paths
+        }
+    )
 
     ns(
         "state",
@@ -986,7 +1005,3 @@ def gen_yapytfgen(
 
     for provider_name, provider_path in providers_paths.items():
         module_dir.joinpath(provider_name).symlink_to(provider_path, target_is_directory=True)
-
-    if make_genbase_link:
-        this_dir = pathlib.Path(__file__).parent
-        module_dir.joinpath("_genbase").symlink_to(this_dir.joinpath("_genbase"), target_is_directory=True)

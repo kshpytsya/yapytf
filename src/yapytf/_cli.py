@@ -1,5 +1,4 @@
 import importlib
-import importlib.machinery
 import inspect
 import json
 import logging
@@ -8,7 +7,8 @@ import runpy
 import shutil
 import sys
 import tempfile
-from typing import Any, Callable, Dict, Generator, List, Mapping, Optional, Tuple
+from typing import (Any, Callable, Dict, Generator, Iterable, List, Mapping,
+                    Optional, Tuple, cast)
 
 import click
 import click_log
@@ -16,13 +16,28 @@ import jsonschema
 import yaml
 
 from implements import implements
+import toposort
 
-from . import (_generator, _hashigetter, _tfrun, _tfschema, _tfstate,
-               cfginterface)
-from . import _genbase  # noqa: F401
+from . import (Configurator, StateBackendConfig, _generator,
+               _hashigetter, _tfrun, _tfschema, _tfstate)
 
 logger = logging.getLogger(__name__)
 click_log.basic_config(logger)
+
+VERSIONS_SCHEMA = {
+    "type": "object",
+    "properties":
+    {
+        "terraform": {"type": "string"},
+        "providers":
+        {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["terraform"],
+    "additionalProperties": False
+}
 
 
 # Per https://stackoverflow.com/questions/17211078/how-to-temporarily-modify-sys-path-in-python
@@ -31,40 +46,11 @@ class AddSysPath:
         self.path = path
 
     def __enter__(self) -> None:
-        sys.path.insert(0, self.path)
+        sys.path.append(self.path)
 
     def __exit__(self, *args: Any) -> None:
         try:
             sys.path.remove(self.path)
-        except ValueError:
-            pass
-
-
-class AddModuleAlias:
-    def __init__(self, alias: str, target_module: str) -> None:
-        class Finder(importlib.abc.MetaPathFinder):
-            @classmethod
-            def find_spec(cls, fullname, path=None, target=None):  # type: ignore
-                if fullname == alias:
-                    class Loader(importlib.abc.Loader):
-                        def create_module(self, spec):  # type: ignore
-                            return sys.modules[target_module]
-
-                        def exec_module(self, module):  # type: ignore
-                            pass
-
-                    return importlib.machinery.ModuleSpec(fullname, Loader())
-                else:
-                    return None
-
-        self._finder = Finder()
-
-    def __enter__(self) -> None:
-        sys.meta_path.insert(0, self._finder)
-
-    def __exit__(self, *args: Any) -> None:
-        try:
-            sys.meta_path.remove(self._finder)
         except ValueError:
             pass
 
@@ -77,45 +63,13 @@ def wipe_dir(d: pathlib.Path) -> None:
             i.unlink()
 
 
-class ConfigurationBase:
-    def __init__(self) -> None:
-        pass
-
-    def schema(self, schema: Dict[str, Any]) -> None:
-        pass
-
-    def state_backend_cfg(
-        self,
-        *,
-        cfg: cfginterface.StateBackendConfiguration,
-        data: cfginterface.JsonType,
-    ) -> None:
-        pass
-
-    def on_success(
-        self,
-        *,
-        state: "yapytfgen.state"  # type: ignore  # noqa
-    ) -> None:
-        pass
-
-    def mementos(
-        self,
-        *,
-        state: "yapytfgen.state",  # type: ignore  # noqa
-        dest: pathlib.Path,
-    ) -> None:
-        pass
-
-
 class Model:
-    versions: Dict[str, Any]
+    _versions: Dict[str, Any]
     _yapytffile_path: pathlib.Path
     _terraform_path: Optional[pathlib.Path]
     _providers_paths: Optional[Mapping[str, pathlib.Path]]
     _providers_schemas: Optional[Mapping[str, Dict[str, Any]]]
-    _state_backend_cfg: cfginterface.StateBackendConfiguration
-    _model_params: Dict[str, Any]
+    _state_backend_cfg: StateBackendConfig
     _work_dir: pathlib.Path
     _resource_type_to_provider: Optional[Dict[str, Dict[str, str]]]
     _resources_schemas_versions: Optional[Dict[Tuple[str, str], int]]
@@ -125,7 +79,7 @@ class Model:
         *,
         path: pathlib.Path,
         model_params: Dict[str, Any],
-        model_class: str,
+        model_classes: Iterable[str],
         work_dir: pathlib.Path,
     ):
         self._yapytffile_path = path
@@ -140,12 +94,28 @@ class Model:
                 f'"{path}" has imported "yapytfgen" module. Please wrap the import with "if typing.TYPE_CHECKING".'
             )
 
-        class_ = py.get(model_class)
-        if not inspect.isclass(class_):
-            raise click.ClickException(f'"{model_class}" is not defined or is not a class')
+        def get_class(name: str) -> Configurator:
+            class_ = py.get(name)
+            if not inspect.isclass(class_):
+                raise click.ClickException(f'"{name}" is not defined or is not a class')
 
-        adapted_class = implements(cfginterface.IConfiguration)(type(model_class, (class_, ConfigurationBase), {}))
-        self.model_obj: cfginterface.IConfiguration = adapted_class()
+            return cast(Configurator, implements(Configurator)(class_))
+
+        classes = {name: get_class(name) for name in model_classes}
+        requires = {name: class_.requires() for name, class_ in classes.items()}
+        unsatisfied = [
+            f"{name}->{j}"
+            for name, i in requires.items()
+            for j in i
+            if j not in model_classes
+        ]
+        if unsatisfied:
+            raise click.ClickException("Unsatisfied model class requirements: " + ", ".join(unsatisfied))
+
+        order = toposort.toposort_flatten(requires)
+        logger.debug("sorted model classes: %s", order)
+
+        ordered_classes = [classes[i] for i in order]
 
         schema: Dict[str, Any] = {
             "$schema": "http://json-schema.org/schema#",
@@ -154,19 +124,28 @@ class Model:
             "required": [],
             "additionalProperties": False
         }
-        self.model_obj.schema(schema)
+
+        for class_ in ordered_classes:
+            class_.schema(schema)
 
         try:
             jsonschema.validate(model_params, schema)
         except jsonschema.exceptions.ValidationError as e:
             raise click.ClickException(e)
 
-        self._model_params = model_params
+        self._configurators: List[Configurator] = [class_(model_params) for class_ in ordered_classes]
 
-        self.versions = dict(providers=dict())
-        self.model_obj.versions(self.versions)
-        self._state_backend_cfg = cfginterface.StateBackendConfiguration()
-        self.model_obj.state_backend_cfg(cfg=self._state_backend_cfg, data=model_params)
+        self._versions = dict(providers=dict())
+        self._state_backend_cfg = StateBackendConfig()
+
+        for i in self._configurators:
+            i.versions(self.versions)
+            i.state_backend_cfg(self._state_backend_cfg)
+
+        try:
+            jsonschema.validate(self.versions, VERSIONS_SCHEMA)
+        except jsonschema.exceptions.ValidationError as e:
+            raise click.ClickException(e)
 
         self._terraform_path = None
         self._providers_paths = None
@@ -175,12 +154,16 @@ class Model:
         self._resources_schemas_versions = None
 
     @property
-    def state_backend_cfg(self) -> cfginterface.StateBackendConfiguration:
+    def state_backend_cfg(self) -> StateBackendConfig:
         return self._state_backend_cfg
 
     @property
+    def versions(self) -> Dict[str, Any]:
+        return self._versions
+
+    @property
     def terraform_version(self) -> str:
-        return self.versions["terraform"]
+        return cast(str, self.versions["terraform"])
 
     @property
     def yapytffile_path(self) -> pathlib.Path:
@@ -255,7 +238,6 @@ class Model:
         self,
         *,
         module_dir: pathlib.Path,
-        make_genbase_link: bool,
     ) -> None:
         logger.debug("terraform_path: %s", self.terraform_path)
         logger.debug("providers_paths: %s", self.providers_paths)
@@ -274,7 +256,6 @@ class Model:
         _generator.gen_yapytfgen(
             module_dir=module_dir,
             providers_paths=providers_py_paths,
-            make_genbase_link=make_genbase_link
         )
 
     def produce_tf_files(
@@ -307,8 +288,10 @@ class Model:
         self,
         destroy: bool = False
     ) -> List[pathlib.Path]:
+        steps: List[Tuple[str, Any]]
+
         if destroy:
-            steps = [("destroy", ...)]
+            steps = [("destroy", None)]
         else:
             steps = [("create1", None)]
 
@@ -317,13 +300,13 @@ class Model:
 
         self.gen_yapytfgen(
             module_dir=module_dir,
-            make_genbase_link=False,
         )
 
-        with AddSysPath(str(self._work_dir)), AddModuleAlias("yapytfgen._genbase", "yapytf._genbase"):
+        with AddSysPath(str(self._work_dir)):
             self.yapytfgen_module = importlib.import_module("yapytfgen")
 
         yapytfgen_model_class = getattr(self.yapytfgen_module, "model")
+        yapytfgen_providers_model_class = getattr(self.yapytfgen_module, "providers_model")
 
         result: List[pathlib.Path] = []
         for step_name, step_data in steps:
@@ -336,12 +319,14 @@ class Model:
                     "tf": {},
                 }
 
-                yapytfgen_model = yapytfgen_model_class(d)
-                self.model_obj.build(
-                    model=yapytfgen_model,
-                    data=self._model_params,
-                    step_data=step_data
-                )
+                yapytfgen_providers_model = yapytfgen_providers_model_class(d)
+                for i in self._configurators:
+                    i.populate_providers(model=yapytfgen_providers_model)
+
+                if not destroy:
+                    yapytfgen_model = yapytfgen_model_class(d)
+                    for i in self._configurators:
+                        i.populate(model=yapytfgen_model, step_data=step_data)
 
                 assert "provider" not in d["tf"]
                 data["provider"] = [
@@ -420,17 +405,17 @@ class PathType(click.Path):
     show_default=True,
 )
 @click.option(
-    "--class",
+    "--classes",
     default="Default",
-    help="Name of a model class to use.",
+    help="Comma separated list of names of a model classes to use.",
     show_default=True,
 )
 @click.option(
     "--params",
     type=PathType(file_okay=True, exists=True),
-    help='json file containing model parameters passed to constructor of the model class.',
+    help='json file containing model parameters passed to constructors of the model classes.',
 )
-@click.option("--keep-work", is_flag=True, help="keep working directory")
+@click.option("--keep-work", is_flag=True, help="Keep working directory.")
 @click.pass_context
 def main(ctx: click.Context, **opts: Any) -> None:
     """
@@ -469,7 +454,7 @@ def main(ctx: click.Context, **opts: Any) -> None:
     co.model = Model(
         path=model_path,
         model_params=model_params,
-        model_class=opts["class"],
+        model_classes=opts["classes"].split(","),
         work_dir=co.work_dir,
     )
 
@@ -480,7 +465,7 @@ def main(ctx: click.Context, **opts: Any) -> None:
 @click.pass_context
 def get(ctx: click.Context, **opts: Any) -> None:
     """
-    Download hashicorp product
+    Download hashicorp product.
     """
     d = _hashigetter.get_hashi_product(opts["product"], opts["ver"])
     logger.info("got: %s", d)
@@ -488,38 +473,63 @@ def get(ctx: click.Context, **opts: Any) -> None:
 
 @main.command()
 @click.pass_context
-def gen(ctx: click.Context, **opts: Any) -> None:
+def dev(ctx: click.Context, **opts: Any) -> None:
     """
-    (Re-)generate "yapytfgen" module in directory containing Yapytffile.py.
+    Set up development environment.
+
+    Sets up development environment in directory containing Yapytffile.py
+    by (re-)generating "yapytfgen" module and symlinking "yapytf" module.
+    This should allow auto-completion (typically based on "jedi")
+    and type checkers such a mypy to "just work".
     Warning, existing "yapytfgen" directory will be completely wiped out.
     As a safeguard, a ".yapytfgen" marker file must exist in that directory.
+    Any existing symlink named "yapytf" will be overwritten.
     """
     co: Context = ctx.find_object(Context)
 
     dest_dir: pathlib.Path = co.model.yapytffile_path.parent
-    module_dir: pathlib.Path = dest_dir.joinpath("yapytfgen")
-    marker_file: pathlib.Path = module_dir.joinpath(".yapytfgen")
-    if module_dir.exists():
+
+    # yapytf symlink
+
+    yapytf_target = pathlib.Path(__file__).parent
+    yapytf_link = dest_dir.joinpath("yapytf")
+
+    if yapytf_link.exists():
+        if not yapytf_link.is_symlink():
+            raise click.ClickException(
+                f"Cowardly refusing to overwrite existing \"{yapytf_link}\", "
+                + "which is not a symlink"
+            )
+
+        yapytf_link.unlink()
+
+    yapytf_link.symlink_to(yapytf_target, target_is_directory=True)
+
+    # yapytfgen module
+
+    yapytfgen_dir: pathlib.Path = dest_dir.joinpath("yapytfgen")
+    marker_file: pathlib.Path = yapytfgen_dir.joinpath(".yapytfgen")
+    if yapytfgen_dir.exists():
         if not marker_file.exists():
             raise click.ClickException(
-                f"Cowardly refusing to wipe existing \"{module_dir}\", "
+                f"Cowardly refusing to wipe existing \"{yapytfgen_dir}\", "
                 + "which does not contain \".yapytfgen\" marker file"
             )
 
-        shutil.rmtree(module_dir)
+        shutil.rmtree(yapytfgen_dir)
 
-    module_dir.mkdir()
+    yapytfgen_dir.mkdir()
     marker_file.touch()
-    module_dir.joinpath(".gitignore").write_text("*\n")
+    yapytfgen_dir.joinpath(".gitignore").write_text("*\n")
 
-    co.model.gen_yapytfgen(module_dir=module_dir, make_genbase_link=True)
+    co.model.gen_yapytfgen(module_dir=yapytfgen_dir)
 
 
 @main.command()
 @click.pass_context
 def lint(ctx: click.Context, **opts: Any) -> None:
     """
-    Validate model file
+    Validate model file.
     """
     co: Context = ctx.find_object(Context)
 
@@ -528,15 +538,15 @@ def lint(ctx: click.Context, **opts: Any) -> None:
 
 @main.command()
 @click.option(
-    "--mementos",
+    "--out",
     type=PathType(dir_okay=True),
-    help="directory into which to store model mementos. Warning: will completely wipe the directory! "
-    "Note that mementos will only be stored in case of a successful execution"
+    help="Directory into which to store model outputs. Warning: will completely wipe the directory! "
+    "Note that outputs will only be written in case of a successful execution."
 )
 @click.pass_context
 def apply(ctx: click.Context, **opts: Any) -> None:
     """
-    Build or change infrastructure
+    Build or change infrastructure.
     """
     co: Context = ctx.find_object(Context)
 
@@ -548,32 +558,32 @@ def apply(ctx: click.Context, **opts: Any) -> None:
 
         yapytfgen_state_class = getattr(co.model.yapytfgen_module, "state")
         state = yapytfgen_state_class(st)
-        co.model.model_obj.on_success(state=state)
 
-        mementos_dir: Optional[pathlib.Path] = opts["mementos"]
-        if mementos_dir is not None:
-            marker_file: pathlib.Path = mementos_dir.joinpath(".yapytf_mementos")
+        out_dir: Optional[pathlib.Path] = opts["out"]
+        if out_dir is not None:
+            marker_file: pathlib.Path = out_dir.joinpath(".yapytf_out")
 
-            if mementos_dir.exists():
+            if out_dir.exists():
                 if not marker_file.exists():
                     raise click.ClickException(
-                        f"Cowardly refusing to wipe existing \"{mementos_dir}\", "
-                        + "which does not contain \".yapytf_mementos\" marker file"
+                        f"Cowardly refusing to wipe existing \"{out_dir}\", "
+                        + "which does not contain \".yapytf_out\" marker file"
                     )
-                wipe_dir(mementos_dir)
+                wipe_dir(out_dir)
             else:
-                mementos_dir.mkdir()
+                out_dir.mkdir()
 
             marker_file.touch()
 
-            co.model.model_obj.mementos(state=state, dest=mementos_dir)
+            for i in co.model._configurators:
+                i.output(state=state, dest=out_dir)
 
 
 @main.command()
 @click.pass_context
 def destroy(ctx: click.Context, **opts: Any) -> None:
     """
-    Destroy Terraform-managed infrastructure
+    Destroy Terraform-managed infrastructure.
     """
     co: Context = ctx.find_object(Context)
 
@@ -589,6 +599,6 @@ def destroy(ctx: click.Context, **opts: Any) -> None:
 )
 def rawtf(ctx: click.Context, **opts: Any) -> None:
     """
-    Execute raw terraform commands
+    Execute raw terraform commands.
     """
     # co: Context = ctx.find_object(Context)
