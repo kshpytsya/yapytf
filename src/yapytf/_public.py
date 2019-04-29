@@ -1,10 +1,10 @@
-import pathlib
-from typing import Any, Dict, Optional, Set, Tuple, Union
+import pathlib as _pathlib
+import typing as _typing
 
-from implements import Interface
+from implements import Interface as _Interface
 
-JsonType = Dict[str, Any]
-SimpleOutputResult = Dict[str, Union[str, Tuple[str, int]]]
+JsonType = _typing.Dict[str, _typing.Any]
+SimpleOutputResult = _typing.Dict[str, _typing.Union[str, _typing.Tuple[str, int]]]
 
 
 class StateBackendConfig:
@@ -12,12 +12,12 @@ class StateBackendConfig:
 
     def __init__(self) -> None:
         self.name: str = "local"
-        self.vars: Dict[str, str] = {}
+        self.vars: _typing.Dict[str, str] = {}
 
 
-class Configurator(Interface):
+class Configurator(_Interface):
     @staticmethod
-    def requires() -> Set[str]:
+    def requires() -> _typing.Set[str]:
         return set()
 
     @classmethod
@@ -27,11 +27,11 @@ class Configurator(Interface):
             schema["required"].append(i)
 
     @staticmethod
-    def schema_required_strings() -> Set[str]:
+    def schema_required_strings() -> _typing.Set[str]:
         return set()
 
     @staticmethod
-    def versions(versions: Dict[str, Any]) -> None:
+    def versions(versions: _typing.Dict[str, _typing.Any]) -> None:
         pass
 
     def __init__(self, data: JsonType) -> None:
@@ -55,7 +55,7 @@ class Configurator(Interface):
         self,
         *,
         model: "yapytfgen.model",  # type: ignore  # noqa
-        step_data: Any,
+        step_data: _typing.Any,
     ) -> None:
         pass
 
@@ -63,17 +63,17 @@ class Configurator(Interface):
         self,
         *,
         state: "yapytfgen.state",  # type: ignore  # noqa
-        dest: pathlib.Path,
+        dest: _pathlib.Path,
     ) -> None:
         for path_str, value in self.simple_output(state=state).items():
-            mode: Optional[int]
+            mode: _typing.Optional[int]
 
             if isinstance(value, tuple):
                 text, mode = value
             else:
                 text, mode = value, None
 
-            path = pathlib.PurePosixPath(path_str)
+            path = _pathlib.PurePosixPath(path_str)
 
             if path.is_absolute():
                 raise RuntimeError(f"simple_output returned absolute path: {path_str}")

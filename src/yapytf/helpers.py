@@ -1,6 +1,14 @@
-import textwrap
-from typing import Any
+import textwrap as _textwrap
+import typing as _typing
 
 
-def format(template_str: str, *args: Any, **kw: Any) -> str:
-    return textwrap.dedent(template_str).lstrip().format(*args, **kw)
+def dedent(s: str) -> str:
+    return _textwrap.dedent(s).lstrip()
+
+
+def format(
+    template_str: str,
+    *args: _typing.Any,
+    **kw: _typing.Any
+) -> str:
+    return dedent(template_str).format(*args, **kw)

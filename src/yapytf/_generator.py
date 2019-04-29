@@ -6,7 +6,7 @@ from typing import (Any, Callable, Dict, Generator, Iterable, List, Mapping,
 
 from . import _pcache
 
-DATA_TYPE_HINT = "Dict[str, Any]"
+DATA_TYPE_HINT = "_typing.Dict[str, _typing.Any]"
 KIND_TO_KEY = {
     "data_source": "data",
     "resource": "resource",
@@ -171,7 +171,7 @@ def make_bag_of_class(
         builder,
         1 if class_path else 2,
         f"class {bag_class_name}",
-        [f"{mapping_type}[{key_type}, \"{full_instance_class_name}\"]"]
+        [f"_typing.{mapping_type}[{key_type}, \"{full_instance_class_name}\"]"]
     )
     class_builder.line("__slots__ = \"_data\"")
 
@@ -217,7 +217,7 @@ def make_bag_of_class(
         1,
         "def __iter__",
         ["self"],
-        f"Iterator[{key_type}]",
+        f"_typing.Iterator[{key_type}]",
         lines=["return self._data.__iter__()"]
     )
     def_block(class_builder, 1, "def __len__", ["self"], "int", lines=["return len(self._data)"])
@@ -263,7 +263,7 @@ def make_list_of_class(
         builder,
         1 if class_path else 2,
         f"class {list_class_name}",
-        [f"MutableSequence[\"{full_instance_class_name}\"]"]
+        [f"_typing.MutableSequence[\"{full_instance_class_name}\"]"]
     )
     class_builder.line("__slots__ = \"_data\"")
 
@@ -271,7 +271,7 @@ def make_list_of_class(
         class_builder,
         1,
         "def __init__",
-        ["self", "data: List[Any]"],
+        ["self", "data: _typing.List[_typing.Any]"],
         "None",
         lines=["self._data = data"]
     )
@@ -279,7 +279,7 @@ def make_list_of_class(
         class_builder,
         1,
         "def __delitem__",
-        ["self", "idx: Union[int, slice]"],
+        ["self", "idx: _typing.Union[int, slice]"],
         "None",
         lines=["self._data.__delitem__(idx)"]
     )
@@ -289,7 +289,7 @@ def make_list_of_class(
         "def __getitem__",
         ["self", "idx: int"],
         f"\"{full_instance_class_name}\"",
-        decorators=["overload"],
+        decorators=["_typing.overload"],
         lines=["..."]
     )
     def_block(
@@ -297,16 +297,16 @@ def make_list_of_class(
         1,
         "def __getitem__",
         ["self", "idx: slice"],
-        f"\"MutableSequence[{full_instance_class_name}]\"",
-        decorators=["overload"],
+        f"\"_typing.MutableSequence[{full_instance_class_name}]\"",
+        decorators=["_typing.overload"],
         lines=["..."]
     )
     def_block(
         class_builder,
         1,
         "def __getitem__",
-        ["self", "idx: Union[int, slice]"],
-        f"Union[\"{full_instance_class_name}\", \"MutableSequence[{full_instance_class_name}]\"]",
+        ["self", "idx: _typing.Union[int, slice]"],
+        f"_typing.Union[\"{full_instance_class_name}\", \"_typing.MutableSequence[{full_instance_class_name}]\"]",
         lines=[
             "if isinstance(idx, slice):",
             f"\treturn [{full_instance_class_name}(i) for i in self._data[idx]]",
@@ -321,16 +321,16 @@ def make_list_of_class(
         "def __setitem__",
         ["self", "idx: int", f"value: \"{full_instance_class_name}\""],
         f"None",
-        decorators=["overload"],
+        decorators=["_typing.overload"],
         lines=["..."]
     )
     def_block(
         class_builder,
         1,
         "def __setitem__",
-        ["self", "idx: slice", f"value: Iterable[\"{full_instance_class_name}\"]"],
+        ["self", "idx: slice", f"value: _typing.Iterable[\"{full_instance_class_name}\"]"],
         "None",
-        decorators=["overload"],
+        decorators=["_typing.overload"],
         lines=["..."]
     )
     def_block(
@@ -339,12 +339,12 @@ def make_list_of_class(
         "def __setitem__",
         [
             "self",
-            "idx: Union[int, slice]",
-            f"value: Union[\"{full_instance_class_name}\", Iterable[\"{full_instance_class_name}\"]]"
+            "idx: _typing.Union[int, slice]",
+            f"value: _typing.Union[\"{full_instance_class_name}\", _typing.Iterable[\"{full_instance_class_name}\"]]"
         ],
         "None",
         lines=[
-            "if isinstance(value, Iterable):",
+            "if isinstance(value, _typing.Iterable):",
             f"\tfor i, j in enumerate(value):",
             f"\t\tif not isinstance(j, {full_instance_class_name}):",
             f"\t\t\traise TypeError(\"expect {full_instance_class_name}, got {{type(j).__name__}} at index {{i}}\")",
@@ -361,7 +361,7 @@ def make_list_of_class(
         "def insert",
         ["self", "index: int", f"object: \"{full_instance_class_name}\""],
         "None",
-        decorators=["overload"],
+        decorators=["_typing.overload"],
         lines=["..."]
     )
     def_block(
@@ -370,14 +370,14 @@ def make_list_of_class(
         "def insert",
         ["self", "index: int"],
         "None",
-        decorators=["overload"],
+        decorators=["_typing.overload"],
         lines=["..."]
     )
     def_block(
         class_builder,
         1,
         "def insert",
-        ["self", "index: int", f"object: Optional[\"{full_instance_class_name}\"] = None"],
+        ["self", "index: int", f"object: _typing.Optional[\"{full_instance_class_name}\"] = None"],
         "None",
         lines=[
             "if object is None:",
@@ -476,7 +476,7 @@ def make_ns_class(
     for prop_name, prop_type in props.items():
         assert prop_name.isidentifier()
         prop_name_slug = "_" if keyword.iskeyword(prop_name) else ""
-        init_block.line(f"self._prop_{prop_name}: Optional[\"{prop_type}\"] = None")
+        init_block.line(f"self._prop_{prop_name}: _typing.Optional[\"{prop_type}\"] = None")
 
         def_block(
             class_builder,
@@ -496,9 +496,9 @@ def make_ns_class(
 def python_type_ann(tf_type: Union[List[str], str]) -> str:
     if isinstance(tf_type, list):
         if tf_type[0] in {"list", "set"} and len(tf_type) == 2:
-            return f"List[{python_type_ann(tf_type[1])}]"
+            return f"_typing.List[{python_type_ann(tf_type[1])}]"
         if tf_type[0] == "map" and len(tf_type) == 2:
-            return f"Dict[str, {python_type_ann(tf_type[1])}]"
+            return f"_typing.Dict[str, {python_type_ann(tf_type[1])}]"
     else:
         if tf_type == "bool":
             return "bool"
@@ -523,7 +523,7 @@ def python_type_assert_cond(tf_type: Union[List[str], str]) -> str:
                 f"all(isinstance(key, str) and {python_type_assert_cond(tf_type[1])} "
                 f"for key, value in value.items())"
             )
-            return f"Dict[str, {python_type_ann(tf_type[1])}]"
+            return f"_typing.Dict[str, {python_type_ann(tf_type[1])}]"
     else:
         if tf_type == "bool":
             return "isinstance(value, bool)"
@@ -559,7 +559,7 @@ def make_schema_class(
         "None",
         lines=[
             "self._data = data",
-            f"self._context_thing: \"Optional[{full_class_name}]\" = None",
+            f"self._context_thing: \"_typing.Optional[{full_class_name}]\" = None",
         ]
     )
 
@@ -579,7 +579,7 @@ def make_schema_class(
         class_builder,
         1,
         "def __exit__",
-        ["self", "*args: Any"],
+        ["self", "*args: _typing.Any"],
         "None",
         lines=[
             "assert self._context_thing is not None",
@@ -604,7 +604,7 @@ def make_schema_class(
                 class_builder,
                 1,
                 f"def _validate_{attr_name}",
-                ["value: Any"],
+                ["value: _typing.Any"],
                 f"{python_type}",
                 decorators=["staticmethod"],
                 lines=[
@@ -626,7 +626,7 @@ def make_schema_class(
                 1,
                 f"def {attr_name}{attr_slug}",
                 ["self"],
-                f"Optional[{python_type}]" if attr_py_optional else python_type,
+                f"_typing.Optional[{python_type}]" if attr_py_optional else python_type,
                 decorators=["property"],
                 lines=[
                     f"result = self._data.get(\"{attr_name}\")",
@@ -800,8 +800,7 @@ def gen_provider_py(
         imports_block = builder.block(indented=False)
         imports_block.lines([
             "import copy",
-            "from typing import cast, Any, Dict, Iterable, Iterator, "
-            + "List, MutableMapping, MutableSequence, Optional, overload, Union",
+            "import typing as _typing",
             "from yapytf import _genbase",
         ])
 
@@ -839,8 +838,7 @@ def gen_provider_py(
 
                     module_builder.lines([
                         "import copy",
-                        "from typing import cast, overload, Iterable, Iterator, Optional, Mapping, MutableMapping, "
-                        + "MutableSequence, List, Dict, Any, Union",
+                        "import typing as _typing",
                         "from yapytf import _genbase",
                     ])
                     module_builder.blanks(1)
@@ -880,7 +878,7 @@ def gen_provider_py(
                         instance_class_name="state_instance",
                         class_path=[],
                         data_path=[],
-                        key_type="Any",
+                        key_type="_typing.Any",
                         reader=True,
                         extra_properties=dict(x=None),
                     )
@@ -920,7 +918,7 @@ def gen_yapytfgen(
     module_fname = module_dir.joinpath("__init__.py")
     builder = Builder()
 
-    builder.line("from typing import Any, Dict, Optional")
+    builder.line("import typing as _typing")
     builder.lines([
         f"from . import {provider_name} as _{provider_name}"
         for provider_name in providers_paths
