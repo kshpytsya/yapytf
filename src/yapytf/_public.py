@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, Set, Tuple, Union
 from implements import Interface
 
 JsonType = Dict[str, Any]
+SimpleOutputResult = Dict[str, Union[str, Tuple[str, int]]]
 
 
 class StateBackendConfig:
@@ -91,5 +92,5 @@ class Configurator(Interface):
         self,
         *,
         state: "yapytfgen.state",  # type: ignore  # noqa
-    ) -> Dict[str, Union[str, Tuple[str, int]]]:
+    ) -> SimpleOutputResult:
         return {}
