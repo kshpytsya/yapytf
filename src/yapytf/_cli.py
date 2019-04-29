@@ -1,3 +1,4 @@
+import functools
 import importlib
 import inspect
 import json
@@ -8,7 +9,7 @@ import shutil
 import sys
 import tempfile
 from typing import (Any, Callable, Dict, Generator, Iterable, List, Mapping,
-                    Optional, Tuple, cast)
+                    Optional, Tuple, Type, cast)
 
 import click
 import click_log
@@ -18,7 +19,7 @@ import yaml
 from implements import implements
 import toposort
 
-from . import (Configurator, StateBackendConfig, _generator,
+from . import (Configurator, JsonType, StateBackendConfig, _generator,
                _hashigetter, _tfrun, _tfschema, _tfstate)
 
 logger = logging.getLogger(__name__)
@@ -63,22 +64,47 @@ def wipe_dir(d: pathlib.Path) -> None:
             i.unlink()
 
 
+def produce_tf_files(
+    *,
+    dest: pathlib.Path,
+    build_cb: Callable[[Dict[str, Any]], None],
+    state_backend_cfg: StateBackendConfig,
+) -> None:
+    def write(path: pathlib.Path, data: Dict[str, Any]) -> None:
+        with path.joinpath("main.tf.json").open("w") as f:
+            json.dump(data, f, indent=4, sort_keys=True)
+
+        with path.joinpath("debug.tf.yaml").open("w") as f:
+            yaml.dump(data, default_flow_style=False, stream=f)
+
+    root_data = {
+        "terraform": {
+            "backend": {
+                state_backend_cfg.name: state_backend_cfg.vars
+            }
+        }
+    }
+
+    build_cb(root_data)
+
+    write(dest, root_data)
+
+
 class Model:
     _versions: Dict[str, Any]
     _yapytffile_path: pathlib.Path
     _terraform_path: Optional[pathlib.Path]
     _providers_paths: Optional[Mapping[str, pathlib.Path]]
     _providers_schemas: Optional[Mapping[str, Dict[str, Any]]]
-    _state_backend_cfg: StateBackendConfig
     _work_dir: pathlib.Path
     _resource_type_to_provider: Optional[Dict[str, Dict[str, str]]]
     _resources_schemas_versions: Optional[Dict[Tuple[str, str], int]]
+    _configurator_classes: List[Type[Configurator]]
 
     def __init__(
         self,
         *,
         path: pathlib.Path,
-        model_params: Dict[str, Any],
         model_classes: Iterable[str],
         work_dir: pathlib.Path,
     ):
@@ -115,10 +141,10 @@ class Model:
         order = toposort.toposort_flatten(requires)
         logger.debug("sorted model classes: %s", order)
 
-        ordered_classes = [classes[i] for i in order]
+        self._configurator_classes = [classes[i] for i in order]
 
         self._versions = dict(providers=dict())
-        for class_ in ordered_classes:
+        for class_ in self._configurator_classes:
             class_.versions(self.versions)
 
         try:
@@ -126,38 +152,11 @@ class Model:
         except jsonschema.exceptions.ValidationError as e:
             raise click.ClickException(e)
 
-        schema: Dict[str, Any] = {
-            "$schema": "http://json-schema.org/schema#",
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": False
-        }
-
-        for class_ in ordered_classes:
-            class_.schema(schema)
-
-        try:
-            jsonschema.validate(model_params, schema)
-        except jsonschema.exceptions.ValidationError as e:
-            raise click.ClickException(e)
-
-        self._configurators: List[Configurator] = [class_(model_params) for class_ in ordered_classes]
-
-        self._state_backend_cfg = StateBackendConfig()
-
-        for i in self._configurators:
-            i.state_backend_cfg(self._state_backend_cfg)
-
         self._terraform_path = None
         self._providers_paths = None
         self._providers_schemas = None
         self._resource_type_to_provider = None
         self._resources_schemas_versions = None
-
-    @property
-    def state_backend_cfg(self) -> StateBackendConfig:
-        return self._state_backend_cfg
 
     @property
     def versions(self) -> Dict[str, Any]:
@@ -236,11 +235,7 @@ class Model:
 
         return self._resources_schemas_versions
 
-    def gen_yapytfgen(
-        self,
-        *,
-        module_dir: pathlib.Path,
-    ) -> None:
+    def gen_yapytfgen(self, module_dir: pathlib.Path) -> None:
         logger.debug("terraform_path: %s", self.terraform_path)
         logger.debug("providers_paths: %s", self.providers_paths)
 
@@ -260,36 +255,35 @@ class Model:
             providers_paths=providers_py_paths,
         )
 
-    def produce_tf_files(
-        self,
-        *,
-        dest: pathlib.Path,
-        build_cb: Optional[Callable[[Dict[str, Any]], None]] = None
-    ) -> None:
-        def write(path: pathlib.Path, data: Dict[str, Any]) -> None:
-            with path.joinpath("main.tf.json").open("w") as f:
-                json.dump(data, f, indent=4, sort_keys=True)
-
-            with path.joinpath("debug.tf.yaml").open("w") as f:
-                yaml.dump(data, default_flow_style=False, stream=f)
-
-        root_data = {
-            "terraform": {
-                "backend": {
-                    self.state_backend_cfg.name: self.state_backend_cfg.vars
-                }
-            }
-        }
-
-        if build_cb:
-            build_cb(root_data)
-
-        write(dest, root_data)
-
     def prepare_steps(
         self,
+        *,
+        model_params: Dict[str, Any],
         destroy: bool = False
-    ) -> List[pathlib.Path]:
+    ) -> Tuple[List[Configurator], List[pathlib.Path]]:
+        schema: Dict[str, Any] = {
+            "$schema": "http://json-schema.org/schema#",
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False
+        }
+
+        for class_ in self._configurator_classes:
+            class_.schema(schema)
+
+        try:
+            jsonschema.validate(model_params, schema)
+        except jsonschema.exceptions.ValidationError as e:
+            raise click.ClickException(e)
+
+        configurators = [class_(model_params) for class_ in self._configurator_classes]
+
+        state_backend_cfg = StateBackendConfig()
+
+        for i in configurators:
+            i.state_backend_cfg(state_backend_cfg)
+
         steps: List[Tuple[str, Any]]
 
         if destroy:
@@ -300,9 +294,7 @@ class Model:
         module_dir = self._work_dir.joinpath("yapytfgen")
         module_dir.mkdir()
 
-        self.gen_yapytfgen(
-            module_dir=module_dir,
-        )
+        self.gen_yapytfgen(module_dir)
 
         with AddSysPath(str(self._work_dir)):
             self.yapytfgen_module = importlib.import_module("yapytfgen")
@@ -322,12 +314,12 @@ class Model:
                 }
 
                 yapytfgen_providers_model = yapytfgen_providers_model_class(d)
-                for i in self._configurators:
+                for i in configurators:
                     i.populate_providers(model=yapytfgen_providers_model)
 
                 if not destroy:
                     yapytfgen_model = yapytfgen_model_class(d)
-                    for i in self._configurators:
+                    for i in configurators:
                         i.populate(model=yapytfgen_model, step_data=step_data)
 
                 assert "provider" not in d["tf"]
@@ -363,7 +355,7 @@ class Model:
             step_dir.mkdir()
             result.append(step_dir)
 
-            self.produce_tf_files(dest=step_dir, build_cb=build)
+            produce_tf_files(dest=step_dir, build_cb=build, state_backend_cfg=state_backend_cfg)
 
             _tfrun.tf_init(
                 work_dir=step_dir,
@@ -376,96 +368,117 @@ class Model:
                 terraform_path=self.terraform_path,
             )
 
-        return result
-
-
-class Context:
-    model: Model
-    work_dir: pathlib.Path
+        return configurators, result
 
 
 class PathType(click.Path):
-    def coerce_path_result(self, rv) -> pathlib.Path:
+    def coerce_path_result(self, rv) -> pathlib.Path:  # type: ignore
         return pathlib.Path(super().coerce_path_result(rv))
 
 
+def click_wrapper(wrapper: Callable[..., None], wrapped: Callable[..., None]) -> Callable[..., None]:
+    wrapped_params = getattr(wrapped, "__click_params__", [])
+    wrapper_params = getattr(wrapper, "__click_params__", [])
+    result = functools.update_wrapper(wrapper, wrapped)
+    result.__click_params__ = wrapped_params + wrapper_params  # type: ignore
+    return result
+
+
+def base_command(func: Callable[..., None]) -> Callable[..., None]:
+    @click_log.simple_verbosity_option(logger)  # type: ignore
+    def wrapper(**opts: Any) -> None:
+        func(**opts)
+
+    return click_wrapper(wrapper, func)
+
+
+def model_class_command(func: Callable[..., None]) -> Callable[..., None]:
+    @base_command
+    @click.option(
+        "--dir",
+        "-C",
+        type=PathType(dir_okay=True, exists=True),
+        default=".",
+        help="Directory containing the model file, instead of the current working directory.",
+    )
+    @click.option(
+        "--file",
+        "-f",
+        metavar="NAME",
+        default="Yapytffile.py",
+        help="Name of a model file to use.",
+        show_default=True,
+    )
+    @click.option(
+        "--classes",
+        metavar="C1[,C2...]",
+        default="Default",
+        help="Comma separated list of names of a model classes to use.",
+        show_default=True,
+    )
+    @click.option("--keep-work", is_flag=True, help="Keep working directory.")
+    def wrapper(**opts: Any) -> None:
+        model_path = opts["dir"].joinpath(opts["file"])
+        if not model_path.exists():
+            raise click.FileError(str(model_path), hint="no such file")
+
+        work_dir = pathlib.Path(tempfile.mkdtemp(prefix="yapytf."))
+
+        try:
+            model = Model(
+                path=model_path,
+                model_classes=opts["classes"].split(","),
+                work_dir=work_dir,
+            )
+            func(model, **opts)
+        finally:
+            if opts["keep_work"]:
+                click.echo('Keeping working directory "{}"'.format(work_dir), err=True)
+            else:
+                shutil.rmtree(work_dir)
+
+    return click_wrapper(wrapper, func)
+
+
+def model_instance_command(func: Callable[..., None]) -> Callable[..., None]:
+    @model_class_command
+    @click.option(
+        "--params",
+        type=PathType(file_okay=True, exists=True),
+        help='json file containing model parameters passed to constructors of the model classes.',
+    )
+    def wrapper(model: Model, **opts: Any) -> None:
+        if opts["params"]:  # types: pathlib.Path
+            with opts["params"].open() as f:
+                try:
+                    model_params = json.load(f)
+                except json.JSONDecodeError as e:
+                    raise click.ClickException("{}: {}".format(opts["params"], e))
+
+            if not isinstance(model_params, dict):
+                raise click.ClickException(
+                    "{}: expected a json object".format(opts["params"])
+                )
+        else:
+            model_params = {}
+
+        func(model, model_params, **opts)
+
+    return click_wrapper(wrapper, func)
+
+
 @click.group()
-@click_log.simple_verbosity_option(logger)
 @click.version_option()
-@click.option(
-    "--dir",
-    "-C",
-    type=PathType(dir_okay=True, exists=True),
-    default=".",
-    help="Directory containing the model file, instead of the current working directory.",
-)
-@click.option(
-    "--file",
-    "-f",
-    default="Yapytffile.py",
-    help="Name of a model file to use.",
-    show_default=True,
-)
-@click.option(
-    "--classes",
-    default="Default",
-    help="Comma separated list of names of a model classes to use.",
-    show_default=True,
-)
-@click.option(
-    "--params",
-    type=PathType(file_okay=True, exists=True),
-    help='json file containing model parameters passed to constructors of the model classes.',
-)
-@click.option("--keep-work", is_flag=True, help="Keep working directory.")
-@click.pass_context
-def main(ctx: click.Context, **opts: Any) -> None:
+def main(**opts: Any) -> None:
     """
     Yet Another Python Terraform Wrapper
     """
-
-    co = ctx.ensure_object(Context)  # type: Context
-
-    if opts["params"]:  # types: pathlib.Path
-        with opts["params"].open() as f:
-            try:
-                model_params = json.load(f)
-            except json.JSONDecodeError as e:
-                raise click.ClickException("{}: {}".format(opts["params"], e))
-
-        if not isinstance(model_params, dict):
-            raise click.ClickException(
-                "{}: expected a json object".format(opts["params"])
-            )
-    else:
-        model_params = {}
-
-    co.work_dir = pathlib.Path(tempfile.mkdtemp(prefix="yapytf."))
-
-    @ctx.call_on_close
-    def cleanup_tmp_dir() -> None:
-        if opts["keep_work"]:
-            click.echo('Keeping working directory "{}"'.format(co.work_dir), err=True)
-        else:
-            shutil.rmtree(co.work_dir)
-
-    model_path = opts["dir"].joinpath(opts["file"])
-    if not model_path.exists():
-        raise click.FileError(str(model_path), hint="no such file")
-
-    co.model = Model(
-        path=model_path,
-        model_params=model_params,
-        model_classes=opts["classes"].split(","),
-        work_dir=co.work_dir,
-    )
 
 
 @main.command(hidden=True)
 @click.argument("product")
 @click.argument("ver")
-@click.pass_context
-def get(ctx: click.Context, **opts: Any) -> None:
+def get(**opts: Any) -> None:
     """
     Download hashicorp product.
     """
@@ -474,8 +487,8 @@ def get(ctx: click.Context, **opts: Any) -> None:
 
 
 @main.command()
-@click.pass_context
-def dev(ctx: click.Context, **opts: Any) -> None:
+@model_class_command
+def dev(model: Model, **opts: Any) -> None:
     """
     Set up development environment.
 
@@ -487,9 +500,8 @@ def dev(ctx: click.Context, **opts: Any) -> None:
     As a safeguard, a ".yapytfgen" marker file must exist in that directory.
     Any existing symlink named "yapytf" will be overwritten.
     """
-    co: Context = ctx.find_object(Context)
 
-    dest_dir: pathlib.Path = co.model.yapytffile_path.parent
+    dest_dir: pathlib.Path = model.yapytffile_path.parent
 
     # yapytf symlink
 
@@ -524,41 +536,39 @@ def dev(ctx: click.Context, **opts: Any) -> None:
     marker_file.touch()
     yapytfgen_dir.joinpath(".gitignore").write_text("*\n")
 
-    co.model.gen_yapytfgen(module_dir=yapytfgen_dir)
+    model.gen_yapytfgen(module_dir=yapytfgen_dir)
 
 
 @main.command()
-@click.pass_context
-def lint(ctx: click.Context, **opts: Any) -> None:
+@model_instance_command
+def lint(model: Model, model_params: JsonType, **opts: Any) -> None:
     """
     Validate model file.
     """
-    co: Context = ctx.find_object(Context)
 
-    co.model.prepare_steps()
+    model.prepare_steps(model_params=model_params)
 
 
 @main.command()
+@model_instance_command
 @click.option(
     "--out",
     type=PathType(dir_okay=True),
     help="Directory into which to store model outputs. Warning: will completely wipe the directory! "
     "Note that outputs will only be written in case of a successful execution."
 )
-@click.pass_context
-def apply(ctx: click.Context, **opts: Any) -> None:
+def apply(model: Model, model_params: JsonType, **opts: Any) -> None:
     """
     Build or change infrastructure.
     """
-    co: Context = ctx.find_object(Context)
 
-    steps = co.model.prepare_steps()
-    if _tfrun.tf_apply(work_dir=steps[0], terraform_path=co.model.terraform_path):
-        st = _tfrun.tf_get_state(work_dir=steps[0], terraform_path=co.model.terraform_path)
-        st = _tfstate.get_resources_attrs(st, co.model.resources_schemas_versions)
+    configurators, steps = model.prepare_steps(model_params=model_params)
+    if _tfrun.tf_apply(work_dir=steps[0], terraform_path=model.terraform_path):
+        st = _tfrun.tf_get_state(work_dir=steps[0], terraform_path=model.terraform_path)
+        st = _tfstate.get_resources_attrs(st, model.resources_schemas_versions)
         # print(yaml.dump(st, default_flow_style=False))
 
-        yapytfgen_state_class = getattr(co.model.yapytfgen_module, "state")
+        yapytfgen_state_class = getattr(model.yapytfgen_module, "state")
         state = yapytfgen_state_class(st)
 
         out_dir: Optional[pathlib.Path] = opts["out"]
@@ -577,24 +587,23 @@ def apply(ctx: click.Context, **opts: Any) -> None:
 
             marker_file.touch()
 
-            for i in co.model._configurators:
+            for i in configurators:
                 i.output(state=state, dest=out_dir)
 
 
 @main.command()
-@click.pass_context
-def destroy(ctx: click.Context, **opts: Any) -> None:
+@model_instance_command
+def destroy(model: Model, model_params: JsonType, **opts: Any) -> None:
     """
     Destroy Terraform-managed infrastructure.
     """
-    co: Context = ctx.find_object(Context)
 
-    steps = co.model.prepare_steps(destroy=True)
-    _tfrun.tf_destroy(work_dir=steps[0], terraform_path=co.model.terraform_path)
+    configurators, steps = model.prepare_steps(model_params=model_params, destroy=True)
+    _tfrun.tf_destroy(work_dir=steps[0], terraform_path=model.terraform_path)
 
 
 @main.command()
-@click.pass_context
+@model_instance_command
 @click.argument(
     "args",
     nargs=-1
@@ -603,4 +612,4 @@ def rawtf(ctx: click.Context, **opts: Any) -> None:
     """
     Execute raw terraform commands.
     """
-    # co: Context = ctx.find_object(Context)
+    # TODO
