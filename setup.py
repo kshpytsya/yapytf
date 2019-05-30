@@ -12,6 +12,7 @@ setup(
     install_requires=[
         "click>=7.0,<8",
         "click-log>=0.3.2,<1",
+        "dataclasses>=0.6,<1; python_version < '3.7'",
         "implements>=0.1.4,<1",
         "jinja2>=2.10.1,<3",
         "jsonschema>=3.0.1,<4",
@@ -19,6 +20,8 @@ setup(
         "requests>=2.21.0,<3",
         "toposort>=1.5,<2",
         "tqdm>=4.31.1,<5",
+        "typeguard>=2.3.1,<3",
+        "typing-inspect>=0.4.0,<1",
         "xdgappdirs>=1.4.5,<2",
     ],
     setup_requires=["setuptools_scm"],
