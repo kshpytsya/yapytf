@@ -316,7 +316,7 @@ def make_schema_class(
         builder,
         1 if class_path else 2,
         f"class {class_name}",
-        [f"_c.Record"]
+        ["_c.Record"]
     )
 
     empty = True
@@ -341,7 +341,7 @@ def make_schema_class(
 
             field_params = []
             if attr_slug:
-                field_params.append(f"name=\"attr_name\"")
+                field_params.append(f"name=\"{attr_name}\"")
 
             class_builder.line(f"{attr_name}{attr_slug} = {python_type}({', '.join(field_params)})")
             empty = False
@@ -518,7 +518,7 @@ def gen_yapytfgen(
         )
 
     ns(
-        f"model_tf_v1_providers",
+        "model_tf_v1_providers",
         {
             provider_name: f"_genbase._DictWithDefault[str, _{provider_name}.v1_model_provider]"
             for provider_name in providers_paths

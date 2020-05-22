@@ -344,10 +344,10 @@ class ConstList(_tp.Sequence[T], _ContextManagerMixin):
         ...
 
     @_tp.overload
-    def __getitem__(self, i: slice) -> _tp.Sequence[T]:  # noqa: F811
+    def __getitem__(self, i: slice) -> _tp.Sequence[T]:
         ...
 
-    def __getitem__(self, i: _tp.Union[int, slice]) -> _tp.Union[T, _tp.Sequence[T]]:  # noqa: F811
+    def __getitem__(self, i: _tp.Union[int, slice]) -> _tp.Union[T, _tp.Sequence[T]]:
         def validate(idx: int, v: _tp.Any) -> T:
             return _tp.cast(T, self._type_ctor(v))
 
@@ -682,10 +682,10 @@ class _List(_tp.MutableSequence[Tval], _tp.Generic[Tval, Tsetter], _ContextManag
         ...
 
     @_tp.overload
-    def __getitem__(self, i: slice) -> _tp.MutableSequence[Tval]:  # noqa: F811
+    def __getitem__(self, i: slice) -> _tp.MutableSequence[Tval]:
         ...
 
-    def __getitem__(self, i: _tp.Union[int, slice]) -> _tp.Union[Tval, _tp.MutableSequence[Tval]]:  # noqa: F811
+    def __getitem__(self, i: _tp.Union[int, slice]) -> _tp.Union[Tval, _tp.MutableSequence[Tval]]:
         container = self._getter.get()
 
         if isinstance(i, slice):
@@ -705,10 +705,10 @@ class _List(_tp.MutableSequence[Tval], _tp.Generic[Tval, Tsetter], _ContextManag
         ...
 
     @_tp.overload
-    def __setitem__(self, i: slice, v: _tp.Iterable[Tsetter]) -> None:  # noqa: F811
+    def __setitem__(self, i: slice, v: _tp.Iterable[Tsetter]) -> None:
         ...
 
-    def __setitem__(self, i: _tp.Union[int, slice], v: _tp.Union[T, _tp.Iterable[Tsetter]]) -> None:  # noqa: F811
+    def __setitem__(self, i: _tp.Union[int, slice], v: _tp.Union[T, _tp.Iterable[Tsetter]]) -> None:
         container = self._getter.get()
         if isinstance(i, slice):
             container[i] = (self._val_setter(j) for j in _tp.cast(_tp.Iterable[Tsetter], v))
@@ -720,10 +720,10 @@ class _List(_tp.MutableSequence[Tval], _tp.Generic[Tval, Tsetter], _ContextManag
         ...
 
     @_tp.overload
-    def __delitem__(self, i: slice) -> None:  # noqa: F811
+    def __delitem__(self, i: slice) -> None:
         ...
 
-    def __delitem__(self, i: _tp.Union[int, slice]) -> None:  # noqa: F811
+    def __delitem__(self, i: _tp.Union[int, slice]) -> None:
         self._getter.get().__delitem__(i)
 
     # ignore Argument 2 of "insert" incompatible with supertype "MutableSequence"
