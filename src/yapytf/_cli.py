@@ -1,4 +1,6 @@
+import dataclasses
 import functools
+import http.server
 import importlib
 import inspect
 import json
@@ -8,19 +10,23 @@ import runpy
 import shutil
 import sys
 import tempfile
+import threading
 from typing import (Any, Callable, Dict, Generator, Iterable, List, Mapping,
                     Optional, Tuple, Type, cast)
+import urllib
+import uuid
 
 import click
 import click_log
-import jsonschema
 import yaml
 
-from implements import implements
+import jsonschema
+import mypy.api
 import toposort
+from implements import implements
 
-from . import (Configurator, JsonType, StateBackendConfig, _generator,
-               _hashigetter, _tfrun, _tfschema, _tfstate)
+from . import (Configurator, JsonType, StateBackendConfig, _genbase,
+               _generator, _hashigetter, _tfrun, _tfschema, _tfstate)
 
 logger = logging.getLogger(__name__)
 click_log.basic_config(logger)
@@ -64,30 +70,47 @@ def wipe_dir(d: pathlib.Path) -> None:
             i.unlink()
 
 
-def produce_tf_files(
-    *,
-    dest: pathlib.Path,
-    build_cb: Callable[[Dict[str, Any]], None],
-    state_backend_cfg: StateBackendConfig,
-) -> None:
-    def write(path: pathlib.Path, data: Dict[str, Any]) -> None:
-        with path.joinpath("main.tf.json").open("w") as f:
-            json.dump(data, f, indent=4, sort_keys=True)
+class Extras(_genbase.Extras):
+    def __init__(
+        self,
+        model: Any,
+        http_server_address: Tuple[str, int] = ("", 0),
+    ) -> None:
+        self.model = model
 
-        with path.joinpath("debug.tf.yaml").open("w") as f:
-            yaml.dump(data, default_flow_style=False, stream=f)
+        self._funcs: List[Callable[..., Any]] = []
+        self._http_server_address = f"{http_server_address[0]}:{http_server_address[1]}"
+        self._http_server_secret = str(uuid.uuid4())
 
-    root_data = {
-        "terraform": {
-            "backend": {
-                state_backend_cfg.name: state_backend_cfg.vars
-            }
-        }
-    }
+    def _http_get(self, path: str) -> Optional[str]:
+        parsed = urllib.parse.urlparse(path)
 
-    build_cb(root_data)
+        if parsed.path != "/":
+            return None
 
-    write(dest, root_data)
+        query = urllib.parse.parse_qs(parsed.query)
+
+        if query.get("s") != [self._http_server_secret]:
+            return None
+
+        f = self._funcs[int(query.get("f", [])[0])]
+        a = json.loads(query.get("a", [])[0])
+        r = f(*a)
+
+        return json.dumps(r)
+
+    def func(self, func: Callable[..., Any], *args: str) -> str:
+        func_n = len(self._funcs)
+        self._funcs.append(func)
+        id = f"_yapytf{func_n:05}"
+        v1 = self.model.tf.v1
+        args_s = ", ".join(args)
+        v1.d.http.X[id].url = (
+            f"http://{self._http_server_address}"
+            f"/?s={self._http_server_secret}&f={func_n}&a=${{urlencode(jsonencode([{args_s}]))}}"
+        )
+        v1.l[id] = f"${{jsondecode(data.http.{id}.body)}}"
+        return f"${{local.{id}}}"
 
 
 class Model:
@@ -143,7 +166,11 @@ class Model:
 
         self._configurator_classes = [classes[i] for i in order]
 
-        self._versions = dict(providers=dict())
+        self._versions = dict(
+            providers={
+                "http": "1.2.0",
+            },
+        )
         for class_ in self._configurator_classes:
             class_.versions(self.versions)
 
@@ -255,12 +282,23 @@ class Model:
             providers_paths=providers_py_paths,
         )
 
+    @dataclasses.dataclass
+    class PreparedStep:
+        path: pathlib.Path
+        http_get_handler: Callable[[str], Optional[str]]
+
+    @dataclasses.dataclass
+    class PreparedSteps:
+        configurators: List[Configurator]
+        steps: List["Model.PreparedStep"]
+
     def prepare_steps(
         self,
         *,
         model_params: Dict[str, Any],
-        destroy: bool = False
-    ) -> Tuple[List[Configurator], List[pathlib.Path]]:
+        destroy: bool = False,
+        http_server_address: Tuple[str, int] = ("", 0),
+    ) -> "Model.PreparedSteps":
         schema: Dict[str, Any] = {
             "$schema": "http://json-schema.org/schema#",
             "type": "object",
@@ -302,28 +340,41 @@ class Model:
         yapytfgen_model_class = getattr(self.yapytfgen_module, "model")
         yapytfgen_providers_model_class = getattr(self.yapytfgen_module, "providers_model")
 
-        result: List[pathlib.Path] = []
+        prepared_steps = []
         for step_name, step_data in steps:
-            def build(data: Dict[str, Any]) -> None:
-                d: Dict[str, Any] = {
-                    "provider": {
-                        provider_name: {'': {}}
-                        for provider_name in self.providers_versions
-                    },
-                    "tf": {},
-                }
+            step_dir = self._work_dir.joinpath(f"step.{step_name}")
+            step_dir.mkdir()
 
-                yapytfgen_providers_model = yapytfgen_providers_model_class(d)
+            d: Dict[str, Any] = {
+                "provider": {
+                    provider_name: {'': {}}
+                    for provider_name in self.providers_versions
+                },
+                "tf": {},
+            }
+
+            yapytfgen_providers_model = yapytfgen_providers_model_class(d)
+            for i in configurators:
+                i.populate_providers(model=yapytfgen_providers_model)
+
+            if not destroy:
+                yapytfgen_model = yapytfgen_model_class(d)
+                extras = d["extras"] = Extras(yapytfgen_model, http_server_address)
+                http_get_handler = extras._http_get
+
                 for i in configurators:
-                    i.populate_providers(model=yapytfgen_providers_model)
+                    i.populate(model=yapytfgen_model, step_data=step_data)
+            else:
+                http_get_handler = lambda path: None
 
-                if not destroy:
-                    yapytfgen_model = yapytfgen_model_class(d)
-                    for i in configurators:
-                        i.populate(model=yapytfgen_model, step_data=step_data)
-
-                assert "provider" not in d["tf"]
-                data["provider"] = [
+            assert "provider" not in d["tf"]
+            step_tf_data = {
+                "terraform": {
+                    "backend": {
+                        state_backend_cfg.name: state_backend_cfg.vars
+                    }
+                },
+                "provider": [
                     {
                         provider_type:
                         {
@@ -333,29 +384,30 @@ class Model:
                     }
                     for provider_type, provider_aliases in d["provider"].items()
                     for provider_alias, provider_data in provider_aliases.items()
-                ]
+                ],
+            }
 
-                def drop_empty(d: Dict[Any, Any]) -> Generator[Any, None, None]:
-                    return ((k, v) for k, v in d.items() if v)
+            def drop_empty(d: Dict[Any, Any]) -> Generator[Any, None, None]:
+                return ((k, v) for k, v in d.items() if v)
 
-                data.update(drop_empty({k: dict(drop_empty(v)) for k, v in d["tf"].items()}))
+            step_tf_data.update(drop_empty({k: dict(drop_empty(v)) for k, v in d["tf"].items()}))
 
-                # expand "provider" properties
-                for kind in ["data", "resource"]:
-                    resource_type_to_provider = self.resource_type_to_provider[kind]
-                    for resource_type, resources in data.get(kind, {}).items():
-                        for resource_name, resource_data in resources.items():
-                            provider_alias = resource_data.get("provider")
-                            if provider_alias is not None:
-                                provider_type = resource_type_to_provider[resource_type]
-                                assert provider_alias in d["provider"][provider_type]
-                                resource_data["provider"] = f"{provider_type}.{provider_alias}"
+            # expand "provider" properties
+            for kind in ["data", "resource"]:
+                resource_type_to_provider = self.resource_type_to_provider[kind]
+                for resource_type, resources in step_tf_data.get(kind, {}).items():
+                    for resource_name, resource_data in resources.items():
+                        provider_alias = resource_data.get("provider")
+                        if provider_alias is not None:
+                            provider_type = resource_type_to_provider[resource_type]
+                            assert provider_alias in d["provider"][provider_type]
+                            resource_data["provider"] = f"{provider_type}.{provider_alias}"
 
-            step_dir = self._work_dir.joinpath(f"step.{step_name}")
-            step_dir.mkdir()
-            result.append(step_dir)
+            with step_dir.joinpath("main.tf.json").open("w") as f:
+                json.dump(step_tf_data, f, indent=4, sort_keys=True)
 
-            produce_tf_files(dest=step_dir, build_cb=build, state_backend_cfg=state_backend_cfg)
+            with step_dir.joinpath("debug.tf.yaml").open("w") as f:
+                yaml.dump(step_tf_data, default_flow_style=False, stream=f)
 
             _tfrun.tf_init(
                 work_dir=step_dir,
@@ -368,7 +420,9 @@ class Model:
                 terraform_path=self.terraform_path,
             )
 
-        return configurators, result
+            prepared_steps.append(Model.PreparedStep(step_dir, http_get_handler))
+
+        return Model.PreparedSteps(configurators, prepared_steps)
 
 
 class PathType(click.Path):
@@ -546,7 +600,30 @@ def lint(model: Model, model_params: JsonType, **opts: Any) -> None:
     Validate model file.
     """
 
+    # TODO chose one of the following:
+    # 1. automatically run "dev" command
+    # 2. fail early and advice to run "dev" if either "yapytfgen" or "yapytf" symlinks is missing
+    # 3. refactor the flow to have lint executed after workdir has been prepared and
+    #    MYPYPATH env var is set accoringly.
+
+    mypy_out, mypy_err, mypy_rc = mypy.api.run([
+        str(model.yapytffile_path),
+        "--cache-dir",
+        str(model.yapytffile_path.with_name(".mypy_cache")),
+        # "--no-incremental",
+        "--strict",
+        "--allow-redefinition",
+        "--follow-imports=silent",
+        "--implicit-reexport",
+    ])
+    if mypy_rc:
+        sys.stdout.write(mypy_out)
+        sys.stderr.write(mypy_err)
+
     model.prepare_steps(model_params=model_params)
+
+    if mypy_rc:
+        sys.exit(1)
 
 
 @main.command()
@@ -562,33 +639,65 @@ def apply(model: Model, model_params: JsonType, **opts: Any) -> None:
     Build or change infrastructure.
     """
 
-    configurators, steps = model.prepare_steps(model_params=model_params)
-    if _tfrun.tf_apply(work_dir=steps[0], terraform_path=model.terraform_path):
-        st = _tfrun.tf_get_state(work_dir=steps[0], terraform_path=model.terraform_path)
-        st = _tfstate.get_resources_attrs(st, model.resources_schemas_versions)
-        # print(yaml.dump(st, default_flow_style=False))
+    http_get_handlers = []
 
-        yapytfgen_state_class = getattr(model.yapytfgen_module, "state")
-        state = yapytfgen_state_class(st)
+    class HTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            logger.debug("http server: {}".format(format % args))
 
-        out_dir: Optional[pathlib.Path] = opts["out"]
-        if out_dir is not None:
-            marker_file: pathlib.Path = out_dir.joinpath(".yapytf_out")
-
-            if out_dir.exists():
-                if not marker_file.exists():
-                    raise click.ClickException(
-                        f"Cowardly refusing to wipe existing \"{out_dir}\", "
-                        + "which does not contain \".yapytf_out\" marker file"
-                    )
-                wipe_dir(out_dir)
+        def do_GET(self) -> None:
+            if not http_get_handlers:
+                self.send_response(404)
             else:
-                out_dir.mkdir()
+                result = http_get_handlers[-1](self.path)
+                self.send_response(404 if result is None else 200)
+                self.send_header("Content-type", "text/text")
+                self.end_headers()
+                if result is not None:
+                    self.wfile.write(result.encode())
 
-            marker_file.touch()
+    http_server = http.server.ThreadingHTTPServer(("localhost", 0), HTTPRequestHandler)
 
-            for i in configurators:
-                i.output(state=state, dest=out_dir)
+    def http_server_func() -> None:
+        http_server.serve_forever(poll_interval=0.1)
+
+    http_server_thread = threading.Thread(target=http_server_func)
+    http_server_thread.start()
+
+    try:
+        steps = model.prepare_steps(model_params=model_params, http_server_address=http_server.server_address)
+        for step in steps.steps:
+            http_get_handlers.append(step.http_get_handler)
+            if _tfrun.tf_apply(work_dir=step.path, terraform_path=model.terraform_path):
+                st = _tfrun.tf_get_state(work_dir=step.path, terraform_path=model.terraform_path)
+                st = _tfstate.get_resources_attrs(st, model.resources_schemas_versions)
+
+                yapytfgen_state_class = getattr(model.yapytfgen_module, "state")
+                state = yapytfgen_state_class(st)
+
+                out_dir: Optional[pathlib.Path] = opts["out"]
+                if out_dir is not None:
+                    marker_file: pathlib.Path = out_dir.joinpath(".yapytf_out")
+
+                    if out_dir.exists():
+                        if not marker_file.exists():
+                            raise click.ClickException(
+                                f"Cowardly refusing to wipe existing \"{out_dir}\", "
+                                + "which does not contain \".yapytf_out\" marker file"
+                            )
+                        wipe_dir(out_dir)
+                    else:
+                        out_dir.mkdir()
+
+                    marker_file.touch()
+
+                    for i in steps.configurators:
+                        i.output(state=state, dest=out_dir)
+            else:
+                sys.exit(1)
+    finally:
+        http_server.shutdown()
+        http_server_thread.join()
 
 
 @main.command()
@@ -598,8 +707,9 @@ def destroy(model: Model, model_params: JsonType, **opts: Any) -> None:
     Destroy Terraform-managed infrastructure.
     """
 
-    configurators, steps = model.prepare_steps(model_params=model_params, destroy=True)
-    _tfrun.tf_destroy(work_dir=steps[0], terraform_path=model.terraform_path)
+    steps = model.prepare_steps(model_params=model_params, destroy=True)
+    assert len(steps.steps) == 1
+    _tfrun.tf_destroy(work_dir=steps.steps[0].path, terraform_path=model.terraform_path)
 
 
 @main.command()
@@ -608,7 +718,7 @@ def destroy(model: Model, model_params: JsonType, **opts: Any) -> None:
     "args",
     nargs=-1
 )
-def rawtf(ctx: click.Context, **opts: Any) -> None:
+def rawtf(model: Model, model_params: JsonType, **opts: Any) -> None:
     """
     Execute raw terraform commands.
     """

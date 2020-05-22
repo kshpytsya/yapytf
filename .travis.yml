@@ -1,4 +1,4 @@
-dist: xenial
+dist: bionic
 language: python
 install:
   - pip install --upgrade setuptools pip
@@ -7,6 +7,7 @@ install:
 python:
   - "3.6"
   - "3.7"
+  - "3.8"
 script:
   - inv check
   - inv build
@@ -17,4 +18,4 @@ deploy:
     on:
       repo: kshpytsya/yapytf
       tags: true
-      python: 3.7
+      python: 3.8

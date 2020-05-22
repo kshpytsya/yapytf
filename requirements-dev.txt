@@ -3,3 +3,4 @@ advbumpversion
 flake8
 twine
 wheel
+jedi

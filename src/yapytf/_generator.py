@@ -6,7 +6,7 @@ from typing import (Any, Callable, Dict, Generator, Iterable, List, Mapping,
 
 from . import _pcache
 
-DATA_TYPE_HINT = "_typing.Dict[str, _typing.Any]"
+# DATA_TYPE_HINT = "_tp.Dict[str, _tp.Any]"
 KIND_TO_KEY = {
     "data_source": "data",
     "resource": "resource",
@@ -37,6 +37,12 @@ _RES_META_ARGS_SCHEMA = {
         }
     }
 }
+
+_COMMON_IMPORTS = [
+    "import typing as _tp",
+    "from yapytf import _containers as _c",
+    "from yapytf import _genbase",
+]
 
 _BuilderChunkGeneratorType = Generator[Tuple[int, str], None, None]
 
@@ -160,161 +166,140 @@ def join_class_path(path: List[str], name: str) -> str:
     return "\"{}\"".format(".".join(path + [name]))
 
 
-def make_bag_of_class(
-    *,
-    builder: Builder,
-    bag_class_name: str,
-    instance_class_name: str,
-    class_path: List[str],
-    data_path: List[str],
-    extra_properties: Mapping[str, Any] = {},
-    reader: bool,
-    key_type: str = "str",
-    auto_create: bool,
-) -> None:
-    full_instance_class_name = join_class_path(class_path, instance_class_name)
-
-    mapping_type = "DirectDictAccessor" if reader else "DirectMutableDictAccessor"
-
-    class_builder = def_block(
-        builder,
-        1 if class_path else 2,
-        f"class {bag_class_name}",
-        [f"_containers.{mapping_type}[{key_type}, {full_instance_class_name}]"]
-    )
-
-    if data_path:
-        class_builder.line("_path = ({})".format("".join(f"\"{i}\", " for i in data_path)))
-
-    if auto_create:
-        class_builder.line("_auto_create = True")
-
-    for prop_name, prop_key in extra_properties.items():
-        assert prop_name.isidentifier()
-        def_block(
-            class_builder,
-            1,
-            f"def {prop_name}",
-            ["self"],
-            f"{full_instance_class_name}",
-            decorators=["property"],
-            lines=[f"return self[{repr(prop_key)}]"]
-        )
-
-
 def make_ns_class(
     *,
     builder: Builder,
     class_name: str,
     props: Mapping[str, str],
+    data_paths: Mapping[str, List[str]] = {},
     nested: bool = False,
-    mutable: bool,
 ) -> None:
     class_builder = def_block(
         builder,
         1 if nested else 2,
         f"class {class_name}",
-        ["_containers.MutableNamespace" if mutable else "_containers.Namespace"],
+        ["_c.Record"],
         doc_string="",
     )
 
-    for prop_name, prop_type in props.items():
+    for prop_name, prop_type in sorted(props.items()):
         assert prop_name.isidentifier()
-        # TODO
-        # prop_name_slug = "_" if keyword.iskeyword(prop_name) else ""
-        class_builder.line(f"{prop_name}: \"{prop_type}\"")
+        prop_name_slug = "_" if keyword.iskeyword(prop_name) else ""
+
+        extra = ""
+
+        data_path = data_paths.get(prop_name, [])
+        if data_path:
+            extra += f", path={repr(data_path)}"
+
+        class_builder.line(f"{prop_name}{prop_name_slug} = _c.ConstRecordField[{prop_type}](no_name=True{extra})")
 
 
-def container_prefix(
-    *,
-    reader: bool,
-    direct: bool,
-) -> str:
-    result = "_containers."
-
-    if direct:
-        result += "Direct"
-    else:
-        result += "DictItem"
-
-    if not reader:
-        result += "Mutable"
-
-    return result
-
-
-def python_type_ann(
+def build_record_field(
     tf_type: Any,
     *,
-    builder: Builder,
     reader: bool,
-    direct: bool,
+    builder: Builder,
     attr_name: str,
     class_path: List[str],
 ) -> str:
-    cp = container_prefix(reader=reader, direct=direct)
+    def inner(
+        tf_type: Any,
+        *,
+        depth: int = 0,
+    ) -> Union[str, Tuple[str, str]]:
+        if isinstance(tf_type, list):
+            tf_type_kind, tf_type_inner = tf_type
 
-    if isinstance(tf_type, list):
-        if tf_type[0] in {"list", "set"} and len(tf_type) == 2:
-            child = python_type_ann(
-                tf_type[1],
-                direct=False,
-                attr_name=attr_name,
-                class_path=class_path,
-                builder=builder,
-                reader=reader,
-            )
-            return f"{cp}ListAccessor[{child}]"
-        if tf_type[0] == "map" and len(tf_type) == 2:
-            child = python_type_ann(
-                tf_type[1],
-                direct=True,
-                attr_name=attr_name,
-                class_path=class_path,
-                builder=builder,
-                reader=reader,
-            )
-            return f"{cp}DictAccessor[str, {child}]"
-        if tf_type[0] == "object" and len(tf_type) == 2:
-            assert isinstance(tf_type[1], dict)
+            if tf_type_kind in {"list", "set", "map"}:
+                child = inner(tf_type_inner, depth=depth + 1)
 
-            instance_class_name = f"_{attr_name}_type"
-            full_instance_class_name = join_class_path(class_path, instance_class_name)
+                if reader:
+                    if tf_type_kind == "map":
+                        return f"_c.ConstDict[str, {child}]"
+                    else:
+                        return f"_c.ConstList[{child}]"
+                else:
+                    ntg = f"_{attr_name}_g{depth}"
+                    nts = f"_{attr_name}_s{depth}"
 
-            class_builder = def_block(
-                builder,
-                1,
-                f"class {instance_class_name}",
-                [f"{cp}ObjectAccessor[{full_instance_class_name}]"]
-            )
+                    if isinstance(child, str):
+                        t1 = "Plain"
+                        t3 = f"{child}"
+                        t4 = child
+                    else:
+                        t1 = ""
+                        t3 = f"{child[0]}, {child[1]}"
+                        t4 = child[1]
 
-            for item_name, item_tf_type in sorted(tf_type[1].items()):
-                assert item_name.isidentifier()
-                # TODO slug -> _renames
-                slug = "_" if keyword.iskeyword(item_name) else ""
-                child = python_type_ann(
-                    item_tf_type,
-                    direct=direct,
-                    attr_name=item_name,
-                    class_path=class_path + [instance_class_name],
-                    builder=class_builder,
-                    reader=reader,
+                    if tf_type_kind == "map":
+                        t2 = "Dict[str, "
+                        ts = f"_tp.Mapping[str, {t4}]"
+                    else:
+                        t2 = "List["
+                        ts = f"_tp.Sequence[{t4}]"
+
+                    builder.line(f"{ntg} = _c.{t1}{t2}{t3}]")
+                    builder.line(f"{nts} = _tp.Union[{ntg}, {ts}]")
+
+                    return ntg, nts
+
+            if tf_type_kind == "object":
+                assert isinstance(tf_type_inner, dict)
+
+                instance_class_name = f"_{attr_name}_type"
+                full_instance_class_name = join_class_path(class_path, instance_class_name)
+
+                class_builder = def_block(
+                    builder,
+                    1,
+                    f"class {instance_class_name}",
+                    ["_c.Record"]
                 )
-                class_builder.line(f"{item_name}{slug}: {child}")
 
-            if not tf_type[1].items():
-                class_builder.line("pass")
+                for item_name, item_tf_type in sorted(tf_type_inner.items()):
+                    assert item_name.isidentifier()
 
-            return full_instance_class_name
+                    field_params: List[str] = []
+
+                    slug = "_" if keyword.iskeyword(item_name) else ""
+                    if slug:
+                        field_params.append(f"name=\"{item_name}\"")
+
+                    child = build_record_field(
+                        item_tf_type,
+                        reader=reader,
+                        attr_name=item_name,
+                        class_path=class_path + [instance_class_name],
+                        builder=class_builder,
+                    )
+
+                    class_builder.line(f"{item_name}{slug} = {child}({', '.join(field_params)})")
+
+                if not tf_type_inner.items():
+                    class_builder.line("pass")
+
+                return full_instance_class_name
+        else:
+            if tf_type == "bool":
+                return "bool"
+            if tf_type == "string":
+                return "str"
+            if tf_type == "number":
+                return "int"
+
+        assert 0, f"Unknown Terraform type {tf_type}"
+
+    r = inner(tf_type)
+
+    if reader:
+        assert isinstance(r, str)
+        return f"_c.ConstRecordField[{r}]"
     else:
-        if tf_type == "bool":
-            return "bool"
-        if tf_type == "string":
-            return "str"
-        if tf_type == "number":
-            return "int"
-
-    assert 0, f"Unknow Terraform type {tf_type}"
+        if isinstance(r, str):
+            return f"_c.PlainRecordField[{r}]"
+        else:
+            return f"_c.RecordField[{r[0]}, {r[1]}]"
 
 
 def make_schema_class(
@@ -324,17 +309,14 @@ def make_schema_class(
     schemas: Iterable[Mapping[str, Any]],
     class_path: List[str],
     reader: bool,
-    direct: bool = False,
 ) -> str:
     full_class_name = join_class_path(class_path, class_name)
-
-    cp = container_prefix(reader=reader, direct=direct)
 
     class_builder = def_block(
         builder,
         1 if class_path else 2,
         f"class {class_name}",
-        [f"{cp}ObjectAccessor[{full_class_name}]"]
+        [f"_c.Record"]
     )
 
     empty = True
@@ -349,15 +331,19 @@ def make_schema_class(
             assert attr_name.isidentifier()
             attr_slug = "_" if keyword.iskeyword(attr_name) else ""
 
-            python_type = python_type_ann(
+            python_type = build_record_field(
                 attr_schema["type"],
                 builder=class_builder,
                 reader=reader,
-                direct=False,
                 attr_name=attr_name,
                 class_path=class_path + [class_name],
             )
-            class_builder.line(f"{attr_name}{attr_slug}: {python_type}")
+
+            field_params = []
+            if attr_slug:
+                field_params.append(f"name=\"attr_name\"")
+
+            class_builder.line(f"{attr_name}{attr_slug} = {python_type}({', '.join(field_params)})")
             empty = False
 
         for attr_name, attr_schema in sorted(schema.get("block", {}).get("block_types", {}).items()):
@@ -376,9 +362,11 @@ def make_schema_class(
             if attr_nesting_mode == "single":
                 class_builder.line(f"{attr_name}{attr_slug}: {attr_class_name}")
             elif attr_nesting_mode in {"list", "set"}:
-                class_builder.line(f"{attr_name}{attr_slug}: {cp}ListAccessor[{attr_class_name}]")
+                # TODO "if reader?"
+                class_builder.line(f"{attr_name}{attr_slug}: _c.PlainList[{attr_class_name}]  # xxx")
             else:
                 assert 0, f"Unknown Terraform nesting_mode {attr_nesting_mode}"
+
     if empty:
         class_builder.line("pass")
 
@@ -407,7 +395,7 @@ def old_make_schema_class(
                 1,
                 f"def {attr_name}{attr_slug}",
                 ["self"],
-                f"_typing.Optional[{python_type}]" if attr_py_optional else python_type,
+                f"_tp.Optional[{python_type}]" if attr_py_optional else python_type,
                 decorators=["property"],
                 lines=[
                     f"result = self._data.get(\"{attr_name}\")",
@@ -448,10 +436,7 @@ def gen_provider_py(
         pschema = provider_schema["provider_schemas"][provider_name]
         builder = Builder()
         imports_block = builder.block(indented=False)
-        imports_block.lines([
-            "import typing as _typing",
-            "from yapytf import _containers, _containers2, _genbase",
-        ])
+        imports_block.lines(_COMMON_IMPORTS)
 
         def make_v1() -> None:
             make_schema_class(
@@ -461,21 +446,12 @@ def gen_provider_py(
                 class_path=[],
                 reader=False,
             )
-            make_bag_of_class(
-                builder=builder,
-                bag_class_name="v1_model_providers",
-                instance_class_name="v1_model_provider",
-                class_path=[],
-                data_path=["provider", provider_name],
-                extra_properties=dict(default=""),
-                reader=False,
-                auto_create=True,
-            )
 
             for kind in ["data_source", "resource"]:
                 ns_props: Dict[str, Dict[str, str]] = {}
+                ns_paths: Dict[str, Dict[str, List[str]]] = {}
 
-                for rname, rschema in pschema.get(f"{kind}_schemas", {}).items():
+                for rname, rschema in sorted(pschema.get(f"{kind}_schemas", {}).items()):
                     if rname == provider_name:
                         stripped_name = "X"
                     else:
@@ -486,63 +462,34 @@ def gen_provider_py(
                     imports_block.line(f"from . import {module_name}")
                     module_builder = Builder()
 
-                    module_builder.lines([
-                        "import typing as _typing",
-                        "from yapytf import _containers, _containers2, _genbase",
-                    ])
+                    module_builder.lines(_COMMON_IMPORTS)
                     module_builder.blanks(1)
 
-                    for what in ["model", "state"]:
-                        ns_props.setdefault(what, {})[stripped_name] = f"{module_name}.{what}_bag"
+                    ns_props.setdefault("model", {})[stripped_name] = f"_c.PlainDict[str, {module_name}.model]"
+                    ns_props.setdefault("state", {})[stripped_name] = \
+                        f"_c.ConstDict[str, _c.ConstList[{module_name}.state]]"
 
-                    make_bag_of_class(
-                        builder=module_builder,
-                        bag_class_name="model_bag",
-                        instance_class_name="model_instance",
-                        class_path=[],
-                        data_path=["tf", KIND_TO_KEY[kind], rname],
-                        reader=False,
-                        auto_create=True,
-                    )
+                    ns_paths.setdefault("model", {})[stripped_name] = ["tf", KIND_TO_KEY[kind], rname]
+                    ns_paths.setdefault("state", {})[stripped_name] = [STATE_KIND_TO_KEY[kind], rname]
 
                     make_schema_class(
                         builder=module_builder,
-                        class_name="model_instance",
+                        class_name="_model",
                         schemas=[_RES_META_ARGS_SCHEMA, rschema],
                         class_path=[],
                         reader=False,
                     )
 
-                    make_bag_of_class(
-                        builder=module_builder,
-                        bag_class_name="state_bag",
-                        instance_class_name="state_inner_bag",
-                        class_path=[],
-                        data_path=[STATE_KIND_TO_KEY[kind], rname],
-                        reader=True,
-                        auto_create=False,
-                    )
-
-                    make_bag_of_class(
-                        builder=module_builder,
-                        bag_class_name="state_inner_bag",
-                        instance_class_name="state_instance",
-                        class_path=[],
-                        data_path=[],
-                        key_type="_typing.Any",
-                        reader=True,
-                        extra_properties=dict(x=None),
-                        auto_create=False,
-                    )
-
                     make_schema_class(
                         builder=module_builder,
-                        class_name="state_instance",
+                        class_name="_state",
                         schemas=[rschema],
                         class_path=[],
                         reader=True,
-                        direct=True,
                     )
+
+                    for what in ["model", "state"]:
+                        module_builder.line(f"{what} = _{what}")
 
                     finalize_builder(module_name, module_builder)
 
@@ -550,13 +497,13 @@ def gen_provider_py(
                     builder=builder,
                     class_name=f"v1_model_{kind}s",
                     props=ns_props.get("model", {}),
-                    mutable=True,
+                    data_paths=ns_paths.get("model", {}),
                 )
                 make_ns_class(
                     builder=builder,
                     class_name=f"v1_state_{kind}s",
                     props=ns_props.get("state", {}),
-                    mutable=False,
+                    data_paths=ns_paths.get("state", {}),
                 )
 
         make_v1()
@@ -580,44 +527,23 @@ def gen_yapytfgen(
         f"from . import {provider_name} as _{provider_name}"
         for provider_name in providers_paths
     ])
-    builder.line("from yapytf import _containers, _containers2, _genbase")
+    builder.lines(_COMMON_IMPORTS)
     builder.blanks(1)
 
-    def xns(mutable: bool, class_name: str, props: Mapping[str, str]) -> None:
+    def ns(
+        class_name: str,
+        props: Mapping[str, str],
+        data_paths: Mapping[str, List[str]] = {},
+    ) -> None:
         make_ns_class(
             builder=builder,
             class_name=class_name,
             props=props,
-            mutable=mutable,
+            data_paths=data_paths,
         )
 
-    def ns(class_name: str, props: Mapping[str, str]) -> None:
-        xns(False, class_name, props)
-
-    def mns(class_name: str, props: Mapping[str, str]) -> None:
-        xns(True, class_name, props)
-
-    mns(
-        "model",
-        {"tf": "model_tf"}
-    )
-
-    mns(
-        "model_tf",
-        {"v1": "model_tf_v1"}
-    )
-
-    mns(
-        "model_tf_v1",
-        {
-            "l": "_genbase.Locals",
-            "d": "model_tf_v1_data_sources",
-            "r": "model_tf_v1_resources",
-        }
-    )
-
     for kind in ["data_source", "resource"]:
-        mns(
+        ns(
             f"model_tf_v1_{kind}s",
             {
                 provider_name: f"_{provider_name}.v1_model_{kind}s"
@@ -625,30 +551,17 @@ def gen_yapytfgen(
             }
         )
 
-    mns(
-        "providers_model",
-        {"v1": "model_tf_v1_providers"}
-    )
-
-    mns(
+    ns(
         f"model_tf_v1_providers",
         {
-            provider_name: f"_{provider_name}.v1_model_providers"
+            provider_name: f"_genbase._DictWithDefault[str, _{provider_name}.v1_model_provider]"
             for provider_name in providers_paths
         }
     )
 
     ns(
-        "state",
-        {"v1": "state_v1"}
-    )
-
-    ns(
-        "state_v1",
-        {
-            "d": "state_v1_data_sources",
-            "r": "state_v1_resources",
-        }
+        "providers_model",
+        {"v1": "model_tf_v1_providers"}
     )
 
     for kind in ["data_source", "resource"]:
@@ -659,6 +572,44 @@ def gen_yapytfgen(
                 for provider_name in providers_paths
             }
         )
+
+    ns(
+        "state_v1",
+        {
+            "d": "state_v1_data_sources",
+            "r": "state_v1_resources",
+        }
+    )
+
+    ns(
+        "state",
+        {"v1": "state_v1"}
+    )
+
+    ns(
+        "model_tf_v1",
+        {
+            "l": "_genbase.Locals",
+            "d": "model_tf_v1_data_sources",
+            "r": "model_tf_v1_resources",
+        }
+    )
+
+    ns(
+        "model_tf",
+        {"v1": "model_tf_v1"}
+    )
+
+    ns(
+        "model",
+        {
+            "tf": "model_tf",
+            "x": "_genbase.Extras",
+        },
+        {
+            "x": ["extras"],
+        }
+    )
 
     produced = builder.produce()
     module_fname.write_text(produced)
