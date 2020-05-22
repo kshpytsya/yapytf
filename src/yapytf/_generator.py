@@ -373,40 +373,6 @@ def make_schema_class(
     return full_class_name
 
 
-def old_make_schema_class(
-    *,
-    builder: Builder,
-    class_name: str,
-    schemas: Iterable[Mapping[str, Any]],
-    class_path: List[str],
-    reader: bool,
-
-    types_set: Dict[str, int],
-) -> str:
-            attr_py_optional = not(attr_computed and reader)
-
-            if attr_py_optional:
-                if_none = "return None"
-            else:
-                if_none = f"raise RuntimeError(\"state is missing computed \\\"{attr_name}\\\" attribute\")"
-
-            def_block(
-                class_builder,
-                1,
-                f"def {attr_name}{attr_slug}",
-                ["self"],
-                f"_tp.Optional[{python_type}]" if attr_py_optional else python_type,
-                decorators=["property"],
-                lines=[
-                    f"result = self._data.get(\"{attr_name}\")",
-                    "if result is None:",
-                    f"\t{if_none}",
-                    "else:",
-                    f"\treturn self._validate_{attr_name}(result)",
-                ]
-            )
-
-
 def gen_provider_py(
     *,
     work_dir: pathlib.Path,

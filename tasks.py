@@ -13,7 +13,7 @@ def bump(ctx, part="patch"):
 
 @task
 def check(ctx):
-    ctx.run("flake8 --max-line-length=120 setup.py tasks.py src")
+    ctx.run("flake8 setup.py tasks.py src")
 
 
 @task
