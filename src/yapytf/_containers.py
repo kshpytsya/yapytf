@@ -17,6 +17,7 @@ def _get_generic_types(
     instance: _tp.Any,
     count: _tp.Union[int, _tp.Set[int]],
     *,
+    module_from: _tp.Any,
     hint: str = ""
 ) -> _tp.Tuple[_tp.Type[_tp.Any], ...]:
     types = _typing_inspect.get_args(_typing_inspect.get_generic_type(instance))
@@ -24,7 +25,7 @@ def _get_generic_types(
     if not types:
         types = _typing_inspect.get_args(_typing_inspect.get_generic_bases(instance)[0])
 
-    globalns = _sys.modules[instance.__class__.__module__].__dict__
+    globalns = _sys.modules[module_from.__module__].__dict__
 
     _eval_type = _tp._eval_type  # type: ignore
     types = tuple(_eval_type(i, globalns, None) for i in types)
@@ -39,6 +40,10 @@ def _get_generic_types(
 
 
 class _Never:
+    pass
+
+
+class _Default:
     pass
 
 
@@ -287,7 +292,14 @@ class _ConstRecordField(_tp.Generic[Tval]):
                 raise AttributeError(e)
 
         if self.val_ctor is None:
-            self.val_ctor = _make_const_ctor(_get_generic_types(self, 1, hint=f". Field {self.name}")[0])
+            self.val_ctor = _make_const_ctor(
+                _get_generic_types(
+                    self,
+                    1,
+                    hint=f". Field {self.name}",
+                    module_from=owner,
+                )[0]
+            )
 
         return _tp.cast(Tval, self.val_ctor(v))
 
@@ -452,6 +464,7 @@ def _make_setter(
 class _RecordField(_tp.Generic[Tval, Tsetter]):
     __slots__ = (
         "name",
+        "owner",
         "val_ctor",
         "val_setter",
         "val_type",
@@ -463,12 +476,18 @@ class _RecordField(_tp.Generic[Tval, Tsetter]):
         self.val_type: _tp.Optional[_tp.Type[_tp.Any]] = None
 
     def __set_name__(self, owner: _tp.Type[Record], name: str) -> None:
+        self.owner = owner
         if self.name is None:
             self.name = name
 
     def _lazy_init(self) -> None:
         if self.val_type is None:
-            types = _get_generic_types(self, {1, 2}, hint=f". Field {self.name}")
+            types = _get_generic_types(
+                self,
+                {1, 2},
+                hint=f". Field {self.name}",
+                module_from=self.owner,
+            )
             if len(types) == 1:
                 types = types * 2
             self.val_type, self.val_setter_type = types
@@ -625,11 +644,17 @@ class _List(_tp.MutableSequence[Tval], _tp.Generic[Tval, Tsetter], _ContextManag
                     check_type(i, raw)
                     return cast(class_(_DirectGetter(raw), types))
 
+                def default() -> _tp.Any:
+                    return []
+
             else:
 
                 def ctor(i: int, raw: _tp.Any) -> Tval:
                     check_type(i, raw)
                     return cast(class_(_NestedDictGetter(raw, [], class_._container_type()), types))
+
+                def default() -> _tp.Any:
+                    return {}
 
             def setter(val: _tp.Any) -> _tp.Any:
                 if isinstance(val, class_):
@@ -648,6 +673,9 @@ class _List(_tp.MutableSequence[Tval], _tp.Generic[Tval, Tsetter], _ContextManag
                 _typeguard.check_type(f"[{i}]", raw, dict)
                 return cast(rec_class(_NestedDictGetter(raw, [], _DictAny)))
 
+            def default() -> _tp.Any:
+                return {}
+
             def setter(val: _tp.Any) -> _tp.Any:
                 _typeguard.check_type("value", val, type_)
                 return _copy.deepcopy(val._getter.get())
@@ -658,11 +686,15 @@ class _List(_tp.MutableSequence[Tval], _tp.Generic[Tval, Tsetter], _ContextManag
                 _typeguard.check_type(f"[{i}]", raw, type_)
                 return cast(raw)
 
+            def default() -> _tp.Any:
+                raise TypeError(f"No default value for {self._val_type}")
+
             def setter(val: _tp.Any) -> _tp.Any:
                 _typeguard.check_type("value", val, type_)
                 return _copy.deepcopy(val)
 
         self._val_ctor = ctor
+        self._val_default = default
         self._val_setter = setter
 
     def _reset_getter(self) -> None:
@@ -726,25 +758,26 @@ class _List(_tp.MutableSequence[Tval], _tp.Generic[Tval, Tsetter], _ContextManag
     def __delitem__(self, i: _tp.Union[int, slice]) -> None:
         self._getter.get().__delitem__(i)
 
-    # ignore Argument 2 of "insert" incompatible with supertype "MutableSequence"
-    # which is due to Tval/Tsetter duality
+    # ignore Argument 2 of "insert" and Argument 1 of "append"
+    # incompatible with supertype "MutableSequence"
+    # which is due to Tval/Tsetter duality and support for insertion of "default" value.
+    # Also, we return inserted value
 
-    def insert(self, i: int, v: Tsetter) -> None:  # type: ignore
-        self._getter.get().insert(i, self._val_setter(v))
+    def insert(self, i: int, v: _tp.Union[Tsetter, _Default] = _Default()) -> Tval:  # type: ignore
+        if isinstance(v, _Default):
+            v2 = self._val_default()
+        else:
+            v2 = self._val_setter(v)
 
-    # ignore Argument 1 of "append" incompatible with supertype "MutableSequence"
-    # which is due to Tval/Tsetter duality
+        container = self._getter.get()
+        container.insert(i, v2)
+        return self._val_ctor(i, container[i])
 
-    def append(self, v: Tsetter) -> None:  # type: ignore
+    def append(self, v: _tp.Union[Tsetter, _Default] = _Default()) -> Tval:  # type: ignore
         # note: a separate "append" is needed as default one does "len" before
         # self._getter.get_autocreate() is called, causing dict item autocreation to fail
 
-        self._getter.get_autocreate().append(self._val_setter(v))
-
-    def insert_new(self, i: int) -> T:
-        pass
-        # TODO
-        # self._get_container_for_write().insert(i, self._validate_and_copy_value(0, v))
+        return self.insert(len(self._getter.get_autocreate()), v)
 
 
 class List(_List[Tval, Tsetter]):

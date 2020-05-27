@@ -34,8 +34,8 @@ _RES_META_ARGS_SCHEMA = {
                 "type": "string",
                 "optional": True
             },
-        }
-    }
+        },
+    },
 }
 
 _COMMON_IMPORTS = [
@@ -162,10 +162,6 @@ def def_block(
     return result
 
 
-def join_class_path(path: List[str], name: str) -> str:
-    return "\"{}\"".format(".".join(path + [name]))
-
-
 def make_ns_class(
     *,
     builder: Builder,
@@ -195,24 +191,35 @@ def make_ns_class(
         class_builder.line(f"{prop_name}{prop_name_slug} = _c.ConstRecordField[{prop_type}](no_name=True{extra})")
 
 
-def build_record_field(
+def build_record(
     tf_type: Any,
     *,
     reader: bool,
     builder: Builder,
-    attr_name: str,
     class_path: List[str],
-) -> str:
-    def inner(
-        tf_type: Any,
-        *,
-        depth: int = 0,
-    ) -> Union[str, Tuple[str, str]]:
+    class_name: str,
+) -> None:
+    class_builder = def_block(
+        builder,
+        1,
+        f"class {class_name}",
+        ["_c.Record"],
+        doc_string="",
+    )
+    child_class_path = class_path + [class_name]
+
+    def _one(tf_type: Any, attr_name: str, *, depth: int = 0) -> Union[str, Tuple[str, str]]:
+        print("   " * depth, tf_type, attr_name, "...")
+        r = _one(tf_type, attr_name, depth=depth)
+        print("   " * depth, "...", r)
+        return r
+
+    def one(tf_type: Any, attr_name: str, *, depth: int = 0) -> Union[str, Tuple[str, str]]:
         if isinstance(tf_type, list):
             tf_type_kind, tf_type_inner = tf_type
 
             if tf_type_kind in {"list", "set", "map"}:
-                child = inner(tf_type_inner, depth=depth + 1)
+                child = one(tf_type_inner, attr_name, depth=depth + 1)
 
                 if reader:
                     if tf_type_kind == "map":
@@ -239,47 +246,25 @@ def build_record_field(
                         t2 = "List["
                         ts = f"_tp.Sequence[{t4}]"
 
-                    builder.line(f"{ntg} = _c.{t1}{t2}{t3}]")
-                    builder.line(f"{nts} = _tp.Union[{ntg}, {ts}]")
+                    class_builder.line(f"{ntg} = _c.{t1}{t2}{t3}]")
+                    class_builder.line(f"{nts} = _tp.Union[{ntg}, {ts}]")
 
                     return ntg, nts
 
             if tf_type_kind == "object":
                 assert isinstance(tf_type_inner, dict)
 
-                instance_class_name = f"_{attr_name}_type"
-                full_instance_class_name = join_class_path(class_path, instance_class_name)
+                child_class_name = f"_{attr_name}_type"
 
-                class_builder = def_block(
-                    builder,
-                    1,
-                    f"class {instance_class_name}",
-                    ["_c.Record"]
+                build_record(
+                    tf_type_inner,
+                    reader=reader,
+                    class_name=child_class_name,
+                    builder=class_builder,
+                    class_path=child_class_path,
                 )
 
-                for item_name, item_tf_type in sorted(tf_type_inner.items()):
-                    assert item_name.isidentifier()
-
-                    field_params: List[str] = []
-
-                    slug = "_" if keyword.iskeyword(item_name) else ""
-                    if slug:
-                        field_params.append(f"name=\"{item_name}\"")
-
-                    child = build_record_field(
-                        item_tf_type,
-                        reader=reader,
-                        attr_name=item_name,
-                        class_path=class_path + [instance_class_name],
-                        builder=class_builder,
-                    )
-
-                    class_builder.line(f"{item_name}{slug} = {child}({', '.join(field_params)})")
-
-                if not tf_type_inner.items():
-                    class_builder.line("pass")
-
-                return full_instance_class_name
+                return "\"{}\"".format(".".join(child_class_path + [child_class_name]))
         else:
             if tf_type == "bool":
                 return "bool"
@@ -290,16 +275,66 @@ def build_record_field(
 
         assert 0, f"Unknown Terraform type {tf_type}"
 
-    r = inner(tf_type)
+    for item_name, item_tf_type in sorted(tf_type.items()):
+        assert item_name.isidentifier()
 
-    if reader:
-        assert isinstance(r, str)
-        return f"_c.ConstRecordField[{r}]"
-    else:
-        if isinstance(r, str):
-            return f"_c.PlainRecordField[{r}]"
+        field_params: List[str] = []
+
+        slug = "_" if keyword.iskeyword(item_name) else ""
+        if slug:
+            field_params.append(f"name=\"{item_name}\"")
+
+        child = one(item_tf_type, item_name)
+
+        if reader:
+            assert isinstance(child, str)
+            child2 = f"_c.ConstRecordField[{child}]"
         else:
-            return f"_c.RecordField[{r[0]}, {r[1]}]"
+            if isinstance(child, str):
+                child2 = f"_c.PlainRecordField[{child}]"
+            else:
+                child2 = f"_c.RecordField[{child[0]}, {child[1]}]"
+
+        class_builder.line(f"{item_name}{slug} = {child2}({', '.join(field_params)})")
+
+
+def parse_tf_schema_block(
+    schema: Mapping[str, Any],
+    parsed: Dict[str, Any],
+    reader: bool,
+) -> None:
+    block_schema = schema.get("block", {})
+
+    for name, child_schema in block_schema.get("attributes", {}).items():
+        assert name not in parsed
+        attr_optional = child_schema.get("optional", False)
+        attr_computed = child_schema.get("computed", False)
+        if not(reader or not(attr_computed) or attr_optional):
+            continue
+
+        parsed[name] = child_schema["type"]
+
+    for name, child_schema in block_schema.get("block_types", {}).items():
+        assert name not in parsed
+
+        attr_optional = child_schema.get("optional", False)
+        attr_computed = child_schema.get("computed", False)
+        if not(reader or not(attr_computed) or attr_optional):
+            continue
+
+        parsed_child: Dict[str, Any] = {}
+        parse_tf_schema_block(child_schema, parsed_child, reader)
+        child: Any = ["object", parsed_child]
+        nesting_mode = child_schema["nesting_mode"]
+
+        if nesting_mode == "single":
+            pass
+        elif nesting_mode in ("list", "set"):
+            child = ["list", child]
+        else:
+            assert 0, f"Unknown Terraform nesting mode {nesting_mode}"
+
+        parsed[name] = child
 
 
 def make_schema_class(
@@ -307,70 +342,23 @@ def make_schema_class(
     builder: Builder,
     class_name: str,
     schemas: Iterable[Mapping[str, Any]],
-    class_path: List[str],
     reader: bool,
-) -> str:
-    full_class_name = join_class_path(class_path, class_name)
-
-    class_builder = def_block(
-        builder,
-        1 if class_path else 2,
-        f"class {class_name}",
-        ["_c.Record"]
-    )
-
-    empty = True
+) -> None:
+    parsed_schemas: Dict[str, Any] = {}
 
     for schema in schemas:
-        for attr_name, attr_schema in sorted(schema.get("block", {}).get("attributes", {}).items()):
-            attr_optional = attr_schema.get("optional", False)
-            attr_computed = attr_schema.get("computed", False)
-            if not(reader or not(attr_computed) or attr_optional):
-                continue
+        parse_tf_schema_block(schema, parsed_schemas, reader)
 
-            assert attr_name.isidentifier()
-            attr_slug = "_" if keyword.iskeyword(attr_name) else ""
-
-            python_type = build_record_field(
-                attr_schema["type"],
-                builder=class_builder,
-                reader=reader,
-                attr_name=attr_name,
-                class_path=class_path + [class_name],
-            )
-
-            field_params = []
-            if attr_slug:
-                field_params.append(f"name=\"{attr_name}\"")
-
-            class_builder.line(f"{attr_name}{attr_slug} = {python_type}({', '.join(field_params)})")
-            empty = False
-
-        for attr_name, attr_schema in sorted(schema.get("block", {}).get("block_types", {}).items()):
-            assert attr_name.isidentifier()
-            attr_slug = "_" if keyword.iskeyword(attr_name) else ""
-
-            attr_class_name = make_schema_class(
-                builder=class_builder,
-                class_name=f"_{attr_name}_type",
-                schemas=[attr_schema],
-                class_path=class_path + [class_name],
-                reader=reader,
-            )
-
-            attr_nesting_mode = attr_schema["nesting_mode"]
-            if attr_nesting_mode == "single":
-                class_builder.line(f"{attr_name}{attr_slug}: {attr_class_name}")
-            elif attr_nesting_mode in {"list", "set"}:
-                # TODO "if reader?"
-                class_builder.line(f"{attr_name}{attr_slug}: _c.PlainList[{attr_class_name}]  # xxx")
-            else:
-                assert 0, f"Unknown Terraform nesting_mode {attr_nesting_mode}"
-
-    if empty:
-        class_builder.line("pass")
-
-    return full_class_name
+    # import json
+    # print(json.dumps(parsed_schemas, indent=4))
+    #
+    build_record(
+        parsed_schemas,
+        reader=reader,
+        builder=builder,
+        class_path=[],
+        class_name=class_name,
+    )
 
 
 def gen_provider_py(
@@ -409,7 +397,6 @@ def gen_provider_py(
                 builder=builder,
                 class_name="v1_model_provider",
                 schemas=[pschema["provider"]],
-                class_path=[],
                 reader=False,
             )
 
@@ -442,7 +429,6 @@ def gen_provider_py(
                         builder=module_builder,
                         class_name="_model",
                         schemas=[_RES_META_ARGS_SCHEMA, rschema],
-                        class_path=[],
                         reader=False,
                     )
 
@@ -450,7 +436,6 @@ def gen_provider_py(
                         builder=module_builder,
                         class_name="_state",
                         schemas=[rschema],
-                        class_path=[],
                         reader=True,
                     )
 
@@ -522,12 +507,17 @@ def gen_yapytfgen(
         {
             provider_name: f"_genbase._DictWithDefault[str, _{provider_name}.v1_model_provider]"
             for provider_name in providers_paths
-        }
+        },
+        {
+            provider_name: ["provider", provider_name]
+            for provider_name in providers_paths
+        },
     )
 
     ns(
         "providers_model",
-        {"v1": "model_tf_v1_providers"}
+        {"v1": "model_tf_v1_providers"},
+
     )
 
     for kind in ["data_source", "resource"]:
